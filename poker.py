@@ -10,7 +10,7 @@ import time
 
 # usage: python3 poker.py [--agents DIR] [--json] [--time SECONDS] [--wins]
 # --json streams a table snapshot per line for the web viewer in web/
-# --wins keeps playing and counts hands won, with busted agents buying back in
+# --wins repeats full freezeouts and counts who wins each one
 LIVE = "--json" in sys.argv
 EVENTS = sys.stdout
 if LIVE:
@@ -366,11 +366,14 @@ class Seat:
             note = note or "illegal"
             dealer.act(i, "check" if "check" in dealer.legal_actions(i) else "fold")
         last = dealer.history[-1]
-        size = f" {last['to']}" if last["action"] in ("bet", "raise") else ""
-        print(f"  {self.name} {last['action']}{size}{f' ({note})' if note else ''}")
+        if not (WINS_MODE and current_limit() < 1):
+            size = f" {last['to']}" if last["action"] in ("bet", "raise") else ""
+            print(f"  {self.name} {last['action']}{size}{f' ({note})' if note else ''}")
         broadcast("action", dealer, actor=i, action={**last, "note": note})
 
     def hand_over(self, dealer, won, shown):
+        if current_limit() < 1 or self.bot is None:
+            return
         result = {
             "board": list(dealer.board),
             "won": dict(won),
@@ -384,9 +387,14 @@ class Seat:
 def broadcast(event, dealer, **extra):
     if not LIVE:
         return
+    # a short clock in the wins race only reports a finished tournament
+    if WINS_MODE and current_limit() < 1 and event != "game":
+        return
     live = tuple(i for i in range(dealer.n) if dealer.in_hand(i))
     key = dealer.hand_number, live, len(dealer.board)
-    if dealer.odds_key != key:  # odds only move when the board or the field changes
+    if current_limit() < 1:
+        dealer.odds = {}
+    elif dealer.odds_key != key:  # odds only move when the board or the field changes
         dealer.odds_key = key
         dealer.odds = win_odds({i: dealer.hands[i] for i in live}, dealer.board, dealer.deck) if len(live) > 1 else {}
     seats = []
@@ -397,7 +405,7 @@ def broadcast(event, dealer, **extra):
         elif dealer.stacks[i] == 0:
             status = "all-in"
         hand_name = None
-        if status not in ("out", "folded") and len(dealer.board) >= 3:
+        if current_limit() >= 1 and status not in ("out", "folded") and len(dealer.board) >= 3:
             hand_name = HAND_NAMES[best_hand(dealer.hands[i] + dealer.board)[0]]
         seats.append({
             "name": name,
@@ -417,7 +425,8 @@ def broadcast(event, dealer, **extra):
         "pot": sum(dealer.invested),
         "button": dealer.button,
         "blinds": [dealer.small_blind, dealer.big_blind],
-        "blinds_double_in": 0 if WINS_MODE else BLINDS_DOUBLE_EVERY - (dealer.hand_number - 1) % BLINDS_DOUBLE_EVERY,
+        "blinds_double_in": BLINDS_DOUBLE_EVERY - (dealer.hand_number - 1) % BLINDS_DOUBLE_EVERY,
+        "game": getattr(dealer, "game_number", None),
         "current_bet": dealer.bet,
         "time_limit": limit,
         "time_pending": pending,
@@ -428,7 +437,8 @@ def broadcast(event, dealer, **extra):
     with write_lock:
         EVENTS.write(json.dumps(snapshot) + "\n")
         EVENTS.flush()
-    time.sleep(PAUSES.get(event, 0))
+    if current_limit() >= 1:
+        time.sleep(PAUSES.get(event, 0))
 
 
 def play_hand(dealer, seats):
@@ -440,7 +450,8 @@ def play_hand(dealer, seats):
         if new_cards:
             dealer.new_street(street)
             dealer.board += [dealer.deck.pop() for _ in range(new_cards)]
-            print(f"  {street}: {' '.join(dealer.board)}")
+            if not (WINS_MODE and current_limit() < 1):
+                print(f"  {street}: {' '.join(dealer.board)}")
             broadcast("street", dealer)
         start = dealer.big_blind_seat if street == "preflop" else dealer.button
         i = dealer.next_seat(start, dealer.can_act)
@@ -451,21 +462,42 @@ def play_hand(dealer, seats):
     pot = sum(dealer.invested)
     won = dealer.award()
     shown = {i: dealer.hands[i] for i in won} if len(won) > 1 else {}
-    for i, cards in shown.items():
-        print(f"  {seats[i].name} shows {' '.join(cards)}")
-    print("  " + ", ".join(f"{seats[i].name} wins {chips}" for i, chips in won.items() if chips))
-    if not hasattr(dealer, "wins"):
-        dealer.wins = [0] * dealer.n
-    for i, chips in won.items():
-        if chips:
-            dealer.wins[i] += 1
-    winners = [{"seat": i, "chips": chips} for i, chips in won.items() if chips]
-    for winner in winners:
-        winner["hand_name"] = HAND_NAMES[best_hand(dealer.hands[winner["seat"]] + dealer.board)[0]] if shown else None
-    broadcast("showdown", dealer, pot=pot, winners=winners, shown=list(shown))
-    for seat in seats:
-        seat.hand_over(dealer, won, shown)
-    dealer.button = dealer.next_seat(dealer.button, dealer.has_chips)
+    if not (WINS_MODE and current_limit() < 1):
+        for i, cards in shown.items():
+            print(f"  {seats[i].name} shows {' '.join(cards)}")
+        print("  " + ", ".join(f"{seats[i].name} wins {chips}" for i, chips in won.items() if chips))
+        winners = [{"seat": i, "chips": chips} for i, chips in won.items() if chips]
+        for winner in winners:
+            winner["hand_name"] = HAND_NAMES[best_hand(dealer.hands[winner["seat"]] + dealer.board)[0]] if shown else None
+        broadcast("showdown", dealer, pot=pot, winners=winners, shown=list(shown))
+        for seat in seats:
+            seat.hand_over(dealer, won, shown)
+    nxt = dealer.next_seat(dealer.button, dealer.has_chips)
+    if nxt is not None:
+        dealer.button = nxt
+
+
+def blinds_for(hand):
+    level = min((hand - 1) // BLINDS_DOUBLE_EVERY, 12)
+    return 5 << level, 10 << level
+
+
+def chip_leader(dealer):
+    return max(range(dealer.n), key=lambda i: dealer.stacks[i])
+
+
+def play_tournament(dealer, seats):
+    for hand in range(1, HANDS + 1):
+        if sum(map(dealer.has_chips, range(dealer.n))) < 2:
+            break
+        dealer.hand_number = hand
+        if apply_pending():
+            announce_clock()
+        dealer.small_blind, dealer.big_blind = blinds_for(hand)
+        if not (WINS_MODE and current_limit() < 1):
+            print(f"\nhand {hand}")
+        play_hand(dealer, seats)
+    return chip_leader(dealer)
 
 
 def main():
@@ -479,28 +511,26 @@ def main():
     dealer.names = [seat.name for seat in seats]
     dealer.wins = [0] * len(seats)
     dealer.odds_key = None
-    for hand in range(1, (WINS_HANDS if WINS_MODE else HANDS) + 1):
-        if WINS_MODE:
-            for i in range(dealer.n):
-                if not dealer.has_chips(i):
-                    dealer.stacks[i] = START_STACK
-        elif sum(map(dealer.has_chips, range(dealer.n))) < 2:
-            break
-        dealer.hand_number = hand
-        if apply_pending():
-            announce_clock()
-        if WINS_MODE:
-            dealer.small_blind, dealer.big_blind = 5, 10
-        else:
-            level = (hand - 1) // BLINDS_DOUBLE_EVERY
-            dealer.small_blind, dealer.big_blind = 5 << level, 10 << level
-        print(f"\nhand {hand}")
-        play_hand(dealer, seats)
+    dealer.game_number = None
 
-    print("\nstandings")
-    for i in sorted(range(len(seats)), key=lambda i: -dealer.stacks[i]):
-        print(f"  {seats[i].name}: {dealer.stacks[i]}")
-    broadcast("final", dealer)
+    if not WINS_MODE:
+        play_tournament(dealer, seats)
+        print("\nstandings")
+        for i in sorted(range(len(seats)), key=lambda i: -dealer.stacks[i]):
+            print(f"  {seats[i].name}: {dealer.stacks[i]}")
+        broadcast("final", dealer)
+        return
+
+    for game in range(1, WINS_HANDS + 1):
+        dealer.stacks = [START_STACK] * dealer.n
+        if not isinstance(dealer.button, int):
+            dealer.button = 0
+        dealer.game_number = game
+        winner = play_tournament(dealer, seats)
+        dealer.wins[winner] += 1
+        if current_limit() >= 1:
+            print(f"\ngame {game}: {seats[winner].name}")
+        broadcast("game", dealer, winner=winner)
 
 
 if __name__ == "__main__":

@@ -21,7 +21,7 @@ export type SeatState = {
 export type Winner = { seat: number; chips: number; hand_name: string | null };
 
 export type Snapshot = {
-  event: "hand" | "thinking" | "action" | "street" | "showdown" | "final" | "clock";
+  event: "hand" | "thinking" | "action" | "street" | "showdown" | "final" | "game" | "clock";
   hand: number;
   street: string;
   board: string[];
@@ -32,7 +32,9 @@ export type Snapshot = {
   current_bet: number;
   time_limit: number;
   time_pending?: number | null;
+  game?: number | null;
   wins?: number[];
+  winner?: number;
   seats: SeatState[];
   actor?: number;
   action?: { seat: number; street: string; action: string; to: number; note: string };
@@ -145,7 +147,9 @@ export function useTable(run: number, lineup: Lineup, timeLimit: number, mode: M
 
     const log = (item: Omit<FeedItem, "id">) => setFeed((items) => [{ ...item, id: nextId++ }, ...items].slice(0, 80));
     const tell = (item: Omit<Story, "id">) => setStory({ ...item, id: nextId++ });
+    let fast = false;
     const fly = (from: Spot, to: Spot, delay = 0, color = "#f5b83d") => {
+      if (fast) return;
       const batch = [0, 70, 140].map((stagger) => ({ id: nextId++, from, to, delay: delay + stagger, color }));
       const ids = new Set(batch.map((flight) => flight.id));
       setFlights((current) => [...current, ...batch]);
@@ -164,6 +168,7 @@ export function useTable(run: number, lineup: Lineup, timeLimit: number, mode: M
         return;
       }
       setConnection("live");
+      fast = s.time_limit < 1;
 
       if (s.event === "clock") {
         setSnap((current) =>
@@ -205,9 +210,9 @@ export function useTable(run: number, lineup: Lineup, timeLimit: number, mode: M
         setActions((current) => ({ ...current, [i]: { label, tone, note } }));
         setTurn(null);
         if (s.seats[i].bet > (before?.bet ?? 0)) fly(seat(i), bet(i));
-        const took = ((Date.now() - turnStartedAt) / 1000).toFixed(1);
+        const took = turnStartedAt ? `${((Date.now() - turnStartedAt) / 1000).toFixed(1)}s` : undefined;
         const said = note ? `${NOTES[note] ?? note}, so ${text}` : text;
-        log({ kind: "action", seat: i, text: said, meta: `${took}s`, tone: note ? "bad" : tone });
+        log({ kind: "action", seat: i, text: said, meta: took, tone: note ? "bad" : tone });
         tell({ seat: i, text: said, tone: note ? "bad" : tone });      } else if (s.event === "showdown") {
         setTurn(null);
         sweepBets(previous);
@@ -227,6 +232,11 @@ export function useTable(run: number, lineup: Lineup, timeLimit: number, mode: M
           const how = top.hand_name ? `with ${top.hand_name.toLowerCase()}` : "when everyone else folds";
           const split = winners.length > 1 ? `, splitting it ${winners.length} ways` : "";
           tell({ seat: top.seat, text: `wins ${chips(s.pot)} ${how}${split}`, tone: "win" });        }
+      } else if (s.event === "game" && s.winner !== undefined) {
+        setTurn(null);
+        setActions({});
+        log({ kind: "final", seat: s.winner, text: "wins the game", tone: "win" });
+        tell({ seat: s.winner, text: "wins the game", tone: "win" });
       } else if (s.event === "final") {
         const leader = s.seats.reduce((best, seat, i) => (seat.stack > s.seats[best].stack ? i : best), 0);
         log({ kind: "final", seat: leader, text: "takes the table", tone: "win" });

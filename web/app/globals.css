@@ -122,6 +122,14 @@ body {
   100% { opacity: 0; transform: translate(-50%, -16px); }
 }
 
+.fast,
+.fast *,
+.fast *::before,
+.fast *::after {
+  animation: none !important;
+  transition: none !important;
+}
+
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {
     animation-duration: 0.01ms !important;

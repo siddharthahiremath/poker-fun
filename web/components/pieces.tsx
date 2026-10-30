@@ -1,6 +1,8 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { createContext, useContext, useEffect, useRef, useState } from "react";
+
+export const Pace = createContext(false);
 
 const PALETTE = ["#9c3d3d", "#2f6484", "#6a5438", "#2f684c", "#8a5a28", "#4a596e", "#7d3f58", "#556332", "#8a4e32", "#3d5270"];
 
@@ -10,6 +12,11 @@ export function useTween(value: number, ms = 600) {
   const [shown, setShown] = useState(value);
   const current = useRef(value);
   useEffect(() => {
+    if (ms <= 0) {
+      current.current = value;
+      setShown(value);
+      return;
+    }
     const from = current.current;
     const start = performance.now();
     let frame = 0;
@@ -27,7 +34,8 @@ export function useTween(value: number, ms = 600) {
 }
 
 export function Num({ value, className = "" }: { value: number; className?: string }) {
-  return <span className={`tabular-nums ${className}`}>{useTween(value).toLocaleString("en-US")}</span>;
+  const fast = useContext(Pace);
+  return <span className={`tabular-nums ${className}`}>{useTween(value, fast ? 0 : 600).toLocaleString("en-US")}</span>;
 }
 
 const CARD_SIZES = {

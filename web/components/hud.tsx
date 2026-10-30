@@ -28,7 +28,7 @@ export function Hud({ snap, turn, story }: { snap: Snapshot | null; turn: Turn |
   if (!snap) {
     return <p className="h-20 text-base text-zinc-500">Shuffling up. The first hand is on its way.</p>;
   }
-  const step = snap.event === "showdown" || snap.event === "final" ? 4 : STEPS.indexOf(snap.street);
+  const step = snap.event === "showdown" || snap.event === "final" || snap.event === "game" ? 4 : STEPS.indexOf(snap.street);
   const actor = turn ? snap.seats[turn.seat] : null;
   const owed = actor ? Math.min(actor.stack, Math.max(0, snap.current_bet - actor.bet)) : 0;
   const doubling = snap.blinds_double_in === 1 ? "double next hand" : `double in ${snap.blinds_double_in} hands`;
@@ -36,6 +36,7 @@ export function Hud({ snap, turn, story }: { snap: Snapshot | null; turn: Turn |
   return (
     <div className="flex flex-col gap-3">
       <div className="flex flex-wrap items-center gap-x-6 gap-y-2 text-sm text-zinc-500">
+        {snap.game != null && snap.game > 0 && <span className="font-medium text-zinc-900">Game {snap.game}</span>}
         <span className="font-medium text-zinc-900">Hand {snap.hand}</span>
         <ol className="flex items-center gap-3" aria-label="Street">
           {STEPS.map((name, k) => (

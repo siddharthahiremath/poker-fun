@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import path from "node:path";
-import { readTime, TIME_MAX, type Mode, type TimeWhen } from "@/lib/options";
+import { readTime, type Mode, type TimeWhen } from "@/lib/options";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -70,7 +70,7 @@ function startGame(lineup: string, timeLimit: number, mode: Mode) {
   });
   const game: Game = { lineup, timeLimit, mode, child, last: null, viewers, done: false };
   shared.pokerGame = game;
-  if (mode !== "wins" && shared.pendingTime) {
+  if (shared.pendingTime) {
     pushTime(game, shared.pendingTime.time, shared.pendingTime.when);
     shared.pendingTime = undefined;
   }
@@ -106,7 +106,7 @@ function startGame(lineup: string, timeLimit: number, mode: Mode) {
 export async function GET(request: Request) {
   const params = new URL(request.url).searchParams;
   const lineup = LINEUPS[params.get("lineup") ?? ""] ? params.get("lineup")! : "demo";
-  const timeLimit = params.get("mode") === "wins" ? TIME_MAX : readTime(params.get("time"));
+  const timeLimit = readTime(params.get("time"));
   const mode: Mode = params.get("mode") === "wins" ? "wins" : "table";
   const current = shared.pokerGame;
   const game =
@@ -172,7 +172,7 @@ export async function POST(request: Request) {
   const time = readTime(body.time == null ? null : String(body.time));
   const when: TimeWhen = body.when === "now" ? "now" : "hand";
   const game = shared.pokerGame;
-  if (!game || game.done || game.mode === "wins") {
+  if (!game || game.done) {
     shared.pendingTime = { time, when };
     return Response.json({ time, when, queued: true });
   }

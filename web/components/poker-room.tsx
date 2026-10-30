@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 import { Hud } from "@/components/hud";
+import { Pace } from "@/components/pieces";
 import { Feed, Standings } from "@/components/sidebar";
 import { Table } from "@/components/table";
 import { WinsChart } from "@/components/wins";
@@ -25,15 +26,14 @@ export function PokerRoom() {
   const [timeLimit, setTimeLimit] = useState(TIME_DEFAULT);
   const [draftTime, setDraftTime] = useState(formatSeconds(TIME_DEFAULT));
   const [when, setWhen] = useState<TimeWhen>("hand");
-  const appliedTime = mode === "wins" ? TIME_MAX : timeLimit;
-  const { snap, turn, actions, feed, story, flights, connection, error } = useTable(run, lineup, appliedTime, mode);
+  const { snap, turn, actions, feed, story, flights, connection, error } = useTable(run, lineup, timeLimit, mode);
+  const fast = (snap?.time_limit ?? timeLimit) < 1;
   const restart = () => setRun((value) => value + 1);
   const applyTime = (raw: string, nextWhen: TimeWhen = when) => {
     const next = readTime(raw);
     setDraftTime(formatSeconds(next));
     setTimeLimit(next);
     setWhen(nextWhen);
-    if (mode === "wins") return;
     void fetch("/api/game", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -42,7 +42,8 @@ export function PokerRoom() {
   };
 
   return (
-    <div className="mx-auto flex min-h-screen max-w-[1520px] flex-col gap-8 px-4 py-6 sm:px-6 lg:px-10 lg:py-8">
+    <Pace.Provider value={fast}>
+    <div className={`mx-auto flex min-h-screen max-w-[1520px] flex-col gap-8 px-4 py-6 sm:px-6 lg:px-10 lg:py-8 ${fast ? "fast" : ""}`}>
       <header className="flex flex-wrap items-center justify-between gap-x-8 gap-y-4">
         <h1 className="text-2xl font-medium text-zinc-900">Agent Hold&apos;em</h1>
 
@@ -81,8 +82,7 @@ export function PokerRoom() {
               </button>
             ))}
           </div>
-          {mode === "table" && (
-            <div className="flex h-9 items-center gap-2 text-sm">
+          <div className="flex h-9 items-center gap-2 text-sm">
               <label className="flex h-9 items-center gap-2 rounded-lg border border-line bg-panel px-3 text-zinc-600">
                 <input
                   type="number"
@@ -127,7 +127,6 @@ export function PokerRoom() {
                 ))}
               </div>
             </div>
-          )}
           <button
             onClick={restart}
             className="inline-flex h-9 items-center rounded-lg bg-zinc-900 px-4 text-sm font-medium text-white transition-[background-color,transform] duration-150 hover:bg-zinc-700 active:scale-[0.98]"
@@ -163,5 +162,6 @@ export function PokerRoom() {
         </aside>
       </main>
     </div>
+    </Pace.Provider>
   );
 }

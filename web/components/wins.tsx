@@ -10,6 +10,7 @@ export function WinsChart({ snap }: { snap: Snapshot | null }) {
 
   const wins = snap.seats.map((_, i) => snap.wins?.[i] ?? 0);
   const top = Math.max(...wins, 0);
+  const played = snap.game ?? wins.reduce((sum, count) => sum + count, 0);
   const ranked = snap.seats
     .map((seat, i) => ({ seat, i, wins: wins[i] }))
     .sort((a, b) => b.wins - a.wins || a.i - b.i);
@@ -19,7 +20,7 @@ export function WinsChart({ snap }: { snap: Snapshot | null }) {
       <header className="flex items-baseline justify-between">
         <h2 className="text-sm font-medium text-zinc-900">Wins</h2>
         <span className="text-xs text-zinc-500">
-          {top === 0 ? "No hands yet" : top === 1 ? "1 hand taken" : `${top} hands taken`}
+          {played === 0 ? "No games yet" : played === 1 ? "1 game" : `${played} games`}
         </span>
       </header>
       <ol className="flex h-80 items-end gap-4">
