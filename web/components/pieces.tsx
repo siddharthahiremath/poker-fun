@@ -101,6 +101,7 @@ export function Avatar({
   name,
   index,
   turnId,
+  startedAt,
   limit,
   thinking,
   small = false,
@@ -108,6 +109,7 @@ export function Avatar({
   name: string;
   index: number;
   turnId?: number;
+  startedAt?: number;
   limit: number;
   thinking: boolean;
   small?: boolean;
@@ -119,7 +121,7 @@ export function Avatar({
         <circle cx="24" cy="24" r="22" fill="none" stroke="var(--color-line)" strokeWidth="3" />
         {thinking && (
           <circle
-            key={turnId}
+            key={`${turnId}-${limit}`}
             className="timer-ring"
             cx="24"
             cy="24"
@@ -127,7 +129,11 @@ export function Avatar({
             fill="none"
             strokeWidth="3"
             strokeLinecap="round"
-            style={{ ["--c" as string]: `${circumference}`, ["--limit" as string]: `${limit}s` }}
+            style={{
+              ["--c" as string]: `${circumference}`,
+              ["--limit" as string]: `${Math.max(limit, 0.001)}s`,
+              animationDelay: `${startedAt ? -Math.max(0, (Date.now() - startedAt) / 1000) : 0}s`,
+            }}
           />
         )}
       </svg>
@@ -153,7 +159,8 @@ export function Countdown({ startedAt, limit }: { startedAt: number; limit: numb
   }, []);
   const left = Math.max(0, limit - (now - startedAt) / 1000);
   const color = left > limit * 0.45 ? "text-zinc-500" : left > limit * 0.15 ? "text-zinc-900" : "text-red-700";
-  return <span className={`font-medium tabular-nums ${color}`}>{left.toFixed(1)}s</span>;
+  const digits = limit < 0.1 ? 3 : limit < 10 ? 2 : 1;
+  return <span className={`font-medium tabular-nums ${color}`}>{left.toFixed(digits)}s</span>;
 }
 
 export const percent = (odds: number) => (odds > 0 && odds < 0.01 ? "<1%" : `${Math.round(odds * 100)}%`);

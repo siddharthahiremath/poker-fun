@@ -21,14 +21,76 @@ def option(flag, default=None):
         return sys.argv[sys.argv.index(flag) + 1]
     return default
 
-def read_time():
-    try:
-        value = float(option("--time", "10"))
-    except (TypeError, ValueError):
-        value = 10.0
-    return min(30.0, max(1.0, value))
+TIME_MIN, TIME_MAX = 0.001, 30.0
 
-TIME_LIMIT = read_time()
+def clamp_time(value, default=10.0):
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return default
+    if value != value or value in (float("inf"), float("-inf")):
+        return default
+    return min(TIME_MAX, max(TIME_MIN, round(value, 3)))
+
+def read_time():
+    return clamp_time(option("--time", "10"))
+
+# the limit can change while a hand is in progress; pending waits for the next hand
+clock_lock = threading.Lock()
+clock = {"limit": read_time(), "pending": None}
+write_lock = threading.Lock()
+
+def clock_state():
+    with clock_lock:
+        return clock["limit"], clock["pending"]
+
+def current_limit():
+    return clock_state()[0]
+
+def announce_clock():
+    if not LIVE:
+        return
+    limit, pending = clock_state()
+    line = json.dumps({"event": "clock", "time_limit": limit, "time_pending": pending}) + "\n"
+    with write_lock:
+        EVENTS.write(line)
+        EVENTS.flush()
+
+def set_clock(seconds, when):
+    seconds = clamp_time(seconds, current_limit())
+    with clock_lock:
+        if when == "hand":
+            clock["pending"] = seconds
+        else:
+            clock["limit"] = seconds
+            clock["pending"] = None
+    announce_clock()
+
+def apply_pending():
+    with clock_lock:
+        if clock["pending"] is None:
+            return False
+        clock["limit"] = clock["pending"]
+        clock["pending"] = None
+        return True
+
+def listen_commands():
+    while True:
+        line = sys.stdin.readline()
+        if not line:
+            return
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            command = json.loads(line)
+            when = "now" if command.get("when") == "now" else "hand"
+            set_clock(command["time"], when)
+        except (json.JSONDecodeError, KeyError, TypeError):
+            continue
+
+if LIVE:
+    threading.Thread(target=listen_commands, daemon=True).start()
 WINS_MODE = "--wins" in sys.argv
 HANDS = 1000 if LIVE else 20
 WINS_HANDS = 100_000
@@ -197,7 +259,7 @@ class Dealer:
         return {
             "seat": i,
             "street": self.street,
-            "time_limit": TIME_LIMIT,
+            "time_limit": current_limit(),
             "hole_cards": list(self.hands[i]),
             "board": list(self.board),
             "pot": sum(self.invested),
@@ -240,8 +302,9 @@ class Dealer:
         return won
 
 
-def run_limited(fn, limit=TIME_LIMIT):
+def run_limited(fn, limit=None):
     # daemon thread so a hung agent can't keep the process alive
+    # limit=None follows the live clock, so a shorter limit can cut off a move already in progress
     result = [False, "timeout"]
 
     def guarded():
@@ -252,8 +315,14 @@ def run_limited(fn, limit=TIME_LIMIT):
 
     thread = threading.Thread(target=guarded, daemon=True)
     thread.start()
-    thread.join(limit)
-    return (False, "timeout") if thread.is_alive() else tuple(result)
+    started = time.monotonic()
+    while thread.is_alive():
+        allowed = current_limit() if limit is None else limit
+        remaining = allowed - (time.monotonic() - started)
+        if remaining <= 0:
+            return False, "timeout"
+        thread.join(min(remaining, 0.02))
+    return tuple(result)
 
 
 def parse_reply(reply):
@@ -280,7 +349,7 @@ class Seat:
             spec.loader.exec_module(module)
             return module.Agent()
 
-        ok, self.bot = run_limited(load)
+        ok, self.bot = run_limited(load, 10)
         if not ok:
             print(f"{name} sits out ({self.bot})")
             self.bot = None
@@ -339,6 +408,7 @@ def broadcast(event, dealer, **extra):
             "hand_name": hand_name,
             "win_odds": dealer.odds.get(i),
         })
+    limit, pending = clock_state()
     snapshot = {
         "event": event,
         "hand": dealer.hand_number,
@@ -349,13 +419,15 @@ def broadcast(event, dealer, **extra):
         "blinds": [dealer.small_blind, dealer.big_blind],
         "blinds_double_in": 0 if WINS_MODE else BLINDS_DOUBLE_EVERY - (dealer.hand_number - 1) % BLINDS_DOUBLE_EVERY,
         "current_bet": dealer.bet,
-        "time_limit": TIME_LIMIT,
+        "time_limit": limit,
+        "time_pending": pending,
         "wins": list(getattr(dealer, "wins", [0] * dealer.n)),
         "seats": seats,
         **extra,
     }
-    EVENTS.write(json.dumps(snapshot) + "\n")
-    EVENTS.flush()
+    with write_lock:
+        EVENTS.write(json.dumps(snapshot) + "\n")
+        EVENTS.flush()
     time.sleep(PAUSES.get(event, 0))
 
 
@@ -415,6 +487,8 @@ def main():
         elif sum(map(dealer.has_chips, range(dealer.n))) < 2:
             break
         dealer.hand_number = hand
+        if apply_pending():
+            announce_clock()
         if WINS_MODE:
             dealer.small_blind, dealer.big_blind = 5, 10
         else:

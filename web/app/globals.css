@@ -134,9 +134,8 @@ body {
   scrollbar-color: #d4d4d0 transparent;
 }
 
-input[type="range"] {
-  width: 144px;
-  height: 16px;
-  accent-color: #18181b;
-  cursor: pointer;
+input[type="number"]::-webkit-outer-spin-button,
+input[type="number"]::-webkit-inner-spin-button {
+  margin: 0;
+  appearance: none;
 }

@@ -9,7 +9,8 @@ SHOVE = 0.08  # chance a raise is all-in
 
 class Agent:
     def decide(self, info):
-        time.sleep(random.uniform(0.2, info["time_limit"] * SLOWNESS))
+        hi = max(0.0, info["time_limit"] * SLOWNESS)
+        time.sleep(random.uniform(0.0, hi))
         legal = info["legal_actions"]
         if ("bet" in legal or "raise" in legal) and random.random() < AGGRESSION:
             low, high = info["min_raise_to"], info["max_raise_to"]

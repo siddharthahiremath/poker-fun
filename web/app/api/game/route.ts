@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import path from "node:path";
-import { readTime, TIME_MAX, type Mode } from "@/lib/options";
+import { readTime, TIME_MAX, type Mode, type TimeWhen } from "@/lib/options";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -22,8 +22,15 @@ type Game = {
   idleTimer?: ReturnType<typeof setTimeout>;
 };
 
+type PendingTime = { time: number; when: TimeWhen };
+
 // one shared table per server, kept on globalThis so dev reloads don't orphan the engine
-const shared = globalThis as unknown as { pokerGame?: Game };
+const shared = globalThis as unknown as { pokerGame?: Game; pendingTime?: PendingTime };
+
+function pushTime(game: Game, time: number, when: TimeWhen) {
+  game.timeLimit = time;
+  game.child.stdin?.write(`${JSON.stringify({ time, when })}\n`);
+}
 
 function broadcast(game: Game, message: string) {
   for (const viewer of game.viewers) {
@@ -59,10 +66,14 @@ function startGame(lineup: string, timeLimit: number, mode: Mode) {
   if (mode === "wins") args.push("--wins");
   const child = spawn(process.env.PYTHON ?? "python3", args, {
     cwd: path.resolve(process.cwd(), ".."),
-    stdio: ["ignore", "pipe", "inherit"],
+    stdio: ["pipe", "pipe", "inherit"],
   });
   const game: Game = { lineup, timeLimit, mode, child, last: null, viewers, done: false };
   shared.pokerGame = game;
+  if (mode !== "wins" && shared.pendingTime) {
+    pushTime(game, shared.pendingTime.time, shared.pendingTime.when);
+    shared.pendingTime = undefined;
+  }
   broadcast(game, "event: reset\ndata: {}\n\n");
 
   let buffer = "";
@@ -102,7 +113,6 @@ export async function GET(request: Request) {
     !current ||
     current.done ||
     current.lineup !== lineup ||
-    current.timeLimit !== timeLimit ||
     current.mode !== mode ||
     params.get("restart") === "1"
       ? startGame(lineup, timeLimit, mode)
@@ -150,4 +160,22 @@ export async function GET(request: Request) {
       Connection: "keep-alive",
     },
   });
+}
+
+export async function POST(request: Request) {
+  let body: { time?: unknown; when?: unknown };
+  try {
+    body = await request.json();
+  } catch {
+    return Response.json({ error: "Expected a time and when to apply it." }, { status: 400 });
+  }
+  const time = readTime(body.time == null ? null : String(body.time));
+  const when: TimeWhen = body.when === "now" ? "now" : "hand";
+  const game = shared.pokerGame;
+  if (!game || game.done || game.mode === "wins") {
+    shared.pendingTime = { time, when };
+    return Response.json({ time, when, queued: true });
+  }
+  pushTime(game, time, when);
+  return Response.json({ time, when, queued: false });
 }

@@ -58,7 +58,15 @@ export function Seat({
       <div
         className={`relative flex items-center rounded-xl border bg-panel py-2 pl-2 shadow-[0_8px_20px_-12px_rgba(24,24,27,0.35)] transition-colors duration-150 ${compact ? "w-40 gap-2 pr-2" : "w-48 gap-3 pr-3"} ${border}`}
       >
-        <Avatar name={seat.name} index={index} turnId={turn?.id} limit={limit} thinking={thinking} small={compact} />
+        <Avatar
+          name={seat.name}
+          index={index}
+          turnId={turn?.id}
+          startedAt={thinking ? turn?.startedAt : undefined}
+          limit={limit}
+          thinking={thinking}
+          small={compact}
+        />
         <div className="min-w-0 flex-1">
           <div className="truncate text-sm font-medium text-zinc-900">{seat.name}</div>
           <div className="flex items-baseline gap-2 whitespace-nowrap text-xs">

@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { Mode } from "@/lib/options";
 
 export type Status = "active" | "folded" | "all-in" | "out";
@@ -21,7 +21,7 @@ export type SeatState = {
 export type Winner = { seat: number; chips: number; hand_name: string | null };
 
 export type Snapshot = {
-  event: "hand" | "thinking" | "action" | "street" | "showdown" | "final";
+  event: "hand" | "thinking" | "action" | "street" | "showdown" | "final" | "clock";
   hand: number;
   street: string;
   board: string[];
@@ -31,6 +31,7 @@ export type Snapshot = {
   blinds_double_in: number;
   current_bet: number;
   time_limit: number;
+  time_pending?: number | null;
   wins?: number[];
   seats: SeatState[];
   actor?: number;
@@ -111,6 +112,8 @@ export function useTable(run: number, lineup: Lineup, timeLimit: number, mode: M
   const [flights, setFlights] = useState<Flight[]>([]);
   const [connection, setConnection] = useState<Connection>("connecting");
   const [error, setError] = useState<string | null>(null);
+  const timeRef = useRef(timeLimit);
+  timeRef.current = timeLimit;
 
   useEffect(() => {
     let live = true;
@@ -127,7 +130,8 @@ export function useTable(run: number, lineup: Lineup, timeLimit: number, mode: M
     setError(null);
 
     // run 0 joins whatever game the server is showing; later runs ask for a fresh one
-    const source = new EventSource(`/api/game?lineup=${lineup}&time=${timeLimit}&mode=${mode}&restart=${run > 0 ? 1 : 0}`);
+    // time is read here, not watched: changing it goes through POST so the hand keeps going
+    const source = new EventSource(`/api/game?lineup=${lineup}&time=${timeRef.current}&mode=${mode}&restart=${run > 0 ? 1 : 0}`);
     const timers: number[] = [];
     let previous: Snapshot | null = null;
     let turnStartedAt = 0;
@@ -160,6 +164,13 @@ export function useTable(run: number, lineup: Lineup, timeLimit: number, mode: M
         return;
       }
       setConnection("live");
+
+      if (s.event === "clock") {
+        setSnap((current) =>
+          current ? { ...current, time_limit: s.time_limit, time_pending: s.time_pending ?? null } : current,
+        );
+        return;
+      }
 
       if (s.event === "hand") {
         const blinds: Record<number, SeatAction> = {};
@@ -248,7 +259,7 @@ export function useTable(run: number, lineup: Lineup, timeLimit: number, mode: M
       source.close();
       timers.forEach((timer) => window.clearTimeout(timer));
     };
-  }, [run, lineup, timeLimit, mode]);
+  }, [run, lineup, mode]);
 
   return { snap, turn, actions, feed, story, flights, connection, error };
 }

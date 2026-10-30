@@ -5,7 +5,7 @@ import { Hud } from "@/components/hud";
 import { Feed, Standings } from "@/components/sidebar";
 import { Table } from "@/components/table";
 import { WinsChart } from "@/components/wins";
-import { TIME_DEFAULT, TIME_MAX, TIME_MIN, type Mode } from "@/lib/options";
+import { formatSeconds, readTime, TIME_DEFAULT, TIME_MAX, TIME_MIN, type Mode, type TimeWhen } from "@/lib/options";
 import { useTable, type Lineup } from "@/lib/use-table";
 
 const LINEUPS: { id: Lineup; label: string }[] = [
@@ -23,14 +23,22 @@ export function PokerRoom() {
   const [lineup, setLineup] = useState<Lineup>("demo");
   const [mode, setMode] = useState<Mode>("table");
   const [timeLimit, setTimeLimit] = useState(TIME_DEFAULT);
-  const [draftTime, setDraftTime] = useState(TIME_DEFAULT);
+  const [draftTime, setDraftTime] = useState(formatSeconds(TIME_DEFAULT));
+  const [when, setWhen] = useState<TimeWhen>("hand");
   const appliedTime = mode === "wins" ? TIME_MAX : timeLimit;
   const { snap, turn, actions, feed, story, flights, connection, error } = useTable(run, lineup, appliedTime, mode);
   const restart = () => setRun((value) => value + 1);
-  const commitTime = (value: number) => {
-    const next = Math.min(TIME_MAX, Math.max(TIME_MIN, Math.round(value)));
-    setDraftTime(next);
+  const applyTime = (raw: string, nextWhen: TimeWhen = when) => {
+    const next = readTime(raw);
+    setDraftTime(formatSeconds(next));
     setTimeLimit(next);
+    setWhen(nextWhen);
+    if (mode === "wins") return;
+    void fetch("/api/game", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ time: next, when: nextWhen }),
+    });
   };
 
   return (
@@ -74,21 +82,51 @@ export function PokerRoom() {
             ))}
           </div>
           {mode === "table" && (
-            <label className="flex h-9 items-center gap-3 text-sm text-zinc-600">
-              <span className="w-10 text-right tabular-nums text-zinc-900">{draftTime}s</span>
-              <input
-                type="range"
-                min={TIME_MIN}
-                max={TIME_MAX}
-                step={1}
-                value={draftTime}
-                aria-label="Seconds per move"
-                onChange={(event) => setDraftTime(Number(event.target.value))}
-                onPointerUp={(event) => commitTime(Number(event.currentTarget.value))}
-                onKeyUp={(event) => commitTime(Number(event.currentTarget.value))}
-                onBlur={(event) => commitTime(Number(event.target.value))}
-              />
-            </label>
+            <div className="flex h-9 items-center gap-2 text-sm">
+              <label className="flex h-9 items-center gap-2 rounded-lg border border-line bg-panel px-3 text-zinc-600">
+                <input
+                  type="number"
+                  inputMode="decimal"
+                  min={TIME_MIN}
+                  max={TIME_MAX}
+                  step="any"
+                  value={draftTime}
+                  aria-label="Seconds per move"
+                  onChange={(event) => setDraftTime(event.target.value)}
+                  onBlur={(event) => applyTime(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") {
+                      event.preventDefault();
+                      applyTime(event.currentTarget.value);
+                    }
+                  }}
+                  className="w-16 bg-transparent text-right tabular-nums text-zinc-900 outline-none"
+                />
+                <span>s</span>
+              </label>
+              <div role="radiogroup" aria-label="When the time limit changes" className="flex h-9 items-center rounded-lg border border-line bg-panel p-1">
+                {([
+                  ["now", "Now"],
+                  ["hand", "Next hand"],
+                ] as const).map(([id, label]) => (
+                  <button
+                    key={id}
+                    type="button"
+                    role="radio"
+                    aria-checked={when === id}
+                    onMouseDown={(event) => event.preventDefault()}
+                    onClick={() => applyTime(draftTime, id)}
+                    className={`flex h-full items-center rounded px-3 font-medium transition-colors duration-150 ${
+                      when === id
+                        ? "bg-zinc-100 text-zinc-900 shadow-[inset_0_0_0_1px_rgba(24,24,27,0.08)]"
+                        : "text-zinc-500 hover:text-zinc-900"
+                    }`}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+            </div>
           )}
           <button
             onClick={restart}

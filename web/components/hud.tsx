@@ -1,6 +1,7 @@
 "use client";
 
 import { Card, Countdown, seatColor } from "@/components/pieces";
+import { formatSeconds } from "@/lib/options";
 import { chips, type Snapshot, type Story, type Turn } from "@/lib/use-table";
 
 const STEPS = ["preflop", "flop", "turn", "river", "showdown"];
@@ -59,7 +60,12 @@ export function Hud({ snap, turn, story }: { snap: Snapshot | null; turn: Turn |
             <span className={snap.blinds_double_in === 1 ? "font-medium text-zinc-900" : ""}>, {doubling}</span>
           )}
         </span>
-        <span>{snap.time_limit}s per move</span>
+        <span>
+          {formatSeconds(snap.time_limit)}s per move
+          {snap.time_pending != null && snap.time_pending !== snap.time_limit && (
+            <span>, {formatSeconds(snap.time_pending)}s next hand</span>
+          )}
+        </span>
       </div>
 
       <div className="flex min-h-14 flex-wrap items-center gap-x-3 gap-y-1 text-2xl font-medium" aria-live="polite">
