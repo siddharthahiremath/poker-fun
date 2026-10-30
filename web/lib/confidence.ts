@@ -72,9 +72,3 @@ export function compare(wins: number, otherWins: number, otherName: string, othe
     significant: pct >= SIGNIFICANT_AT,
   };
 }
-
-export function describe(player: string, call: Call) {
-  if (call.side === "even") return `50% even with ${call.name}`;
-  const gap = call.significant ? ", significant" : "";
-  return `${call.label} sure ${player} is ${call.side} than ${call.name}${gap}`;
-}
