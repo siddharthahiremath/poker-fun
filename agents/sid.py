@@ -1,1306 +1,316 @@
-# sid: an adaptive hold'em agent.
-#
-# Every seat gets a running profile built from the actions it takes: how often it folds,
-# calls, or raises at each preflop level, how often it calls off its stack, and how it bets
-# after the flop. Those frequencies turn into ranges (a seat that shoves every hand has a
-# random shoving range, a seat that raises 5% of hands does not). A second number per seat
-# says how much it plays its cards at all; showdowns and its betting shape move that number.
-# Every option is then scored in chips and the best one is played.
-#
-# Preflop runs on precomputed equity tables so it answers in well under a millisecond.
-# After the flop it runs a Monte Carlo against the modeled ranges for a slice of the clock.
-
-import base64
-import random
-import time
-import zlib
-
-# alpha < 1 values chips slightly concavely, so a thin edge isn't worth flipping the whole stack.
-# Blinds double every 3 hands, so waiting for a better spot is expensive; keep it close to 1.
-TUNE = {"alpha": 0.9, "learn": True}
-
-RANKS = ["2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K", "A"]
-RANK_OF = {r: i for i, r in enumerate(RANKS)}
-SUIT_OF = {s: i for i, s in enumerate("♠♥♦♣")}
-
-
-def card_id(text):
-    return RANK_OF[text[:-1]] * 4 + SUIT_OF[text[-1]]
-
-
-# ---------------------------------------------------------------- evaluator
-# A card is rank * 4 + suit. Rank counts pack into 3 bits per rank and suit counts into
-# 4 bits per suit, so a hand without a flush is one dict lookup on the summed rank key.
-
-RK = [1 << (3 * (c >> 2)) for c in range(52)]
-SK = [1 << (4 * (c & 3)) for c in range(52)]
-RB = [1 << (c >> 2) for c in range(52)]
-FLUSH_ADD = 0x3333  # a suit nibble of 5 or more carries into bit 3 of that nibble
-FLUSH_BITS = 0x8888
-
-
-def _code(category, ranks):
-    value = category
-    for i in range(5):
-        value = (value << 4) | (ranks[i] if i < len(ranks) else 0)
-    return value
-
-
-def _straight_top(mask):
-    for top in range(12, 3, -1):
-        run = 0b11111 << (top - 4)
-        if (mask & run) == run:
-            return top
-    if (mask & 0b1000000001111) == 0b1000000001111:
-        return 3
-    return -1
-
-
-def _four_of_five(mask):
-    windows = [0b11111 << low for low in range(9)] + [0b1000000001111]
-    return any(bin(mask & w).count("1") >= 4 for w in windows)
-
-
-STRAIGHT_TOP = [_straight_top(m) for m in range(8192)]
-STRAIGHT_DRAW = [_four_of_five(m) for m in range(8192)]
-FLUSH_VALUE = [0] * 8192
-for _m in range(8192):
-    if bin(_m).count("1") >= 5:
-        _top = STRAIGHT_TOP[_m]
-        if _top >= 0:
-            FLUSH_VALUE[_m] = _code(8, [_top])
-        else:
-            FLUSH_VALUE[_m] = _code(5, [r for r in range(12, -1, -1) if _m >> r & 1][:5])
-
-
-def _plain_value(counts):
-    present = [r for r in range(12, -1, -1) if counts[r]]
-    mask = 0
-    for r in present:
-        mask |= 1 << r
-    quads = [r for r in present if counts[r] == 4]
-    trips = [r for r in present if counts[r] == 3]
-    pairs = [r for r in present if counts[r] == 2]
-    if quads:
-        q = quads[0]
-        return _code(7, [q] + [r for r in present if r != q][:1])
-    if trips and (len(trips) > 1 or pairs):
-        t = trips[0]
-        return _code(6, [t, max(trips[1:] + pairs)])
-    top = STRAIGHT_TOP[mask]
-    if top >= 0:
-        return _code(4, [top])
-    if trips:
-        t = trips[0]
-        return _code(3, [t] + [r for r in present if r != t][:2])
-    if len(pairs) >= 2:
-        a, b = pairs[0], pairs[1]
-        return _code(2, [a, b] + [r for r in present if r != a and r != b][:1])
-    if pairs:
-        p = pairs[0]
-        return _code(1, [p] + [r for r in present if r != p][:3])
-    return _code(0, present[:5])
-
-
-def _build_plain():
-    table = {}
-    counts = [0] * 13
-
-    def walk(rank, total, key):
-        if rank == 13:
-            if total >= 5:
-                table[key] = _plain_value(counts)
-            return
-        for c in range(min(4, 7 - total) + 1):
-            counts[rank] = c
-            walk(rank + 1, total + c, key + (c << (3 * rank)))
-        counts[rank] = 0
-
-    walk(0, 0, 0)
-    return table
-
-
-PLAIN = _build_plain()
-
-
-def _flush_value(cards, suits):
-    for suit in range(4):
-        if ((suits >> (4 * suit)) & 15) >= 5:
-            mask = 0
-            for c in cards:
-                if (c & 3) == suit:
-                    mask |= RB[c]
-            return FLUSH_VALUE[mask]
-    return 0
-
-
-def evaluate(cards):
-    key = suits = 0
-    for c in cards:
-        key += RK[c]
-        suits += SK[c]
-    if (suits + FLUSH_ADD) & FLUSH_BITS:
-        return _flush_value(cards, suits)
-    return PLAIN[key]
-
-
-TWO_PAIR = _code(2, [0, 0, 0])
-PAIR_TENS = _code(1, [8, 12, 11, 10])
-PAIR_SIXES = _code(1, [4, 12, 11, 10])
-
-
-def strength(a, b, board):
-    # made hand value, with draws on the flop and turn counted as a middling pair
-    cards = [a, b] + board
-    value = evaluate(cards)
-    if len(board) >= 5 or value >= TWO_PAIR:
-        return value
-    suits = board_suits = 0
-    mask = board_mask = 0
-    for c in board:
-        board_suits += SK[c]
-        board_mask |= RB[c]
-    suits = board_suits + SK[a] + SK[b]
-    mask = board_mask | RB[a] | RB[b]
-    flush_draw = any(((suits >> (4 * s)) & 15) == 4 and ((board_suits >> (4 * s)) & 15) < 4 for s in range(4))
-    straight_draw = STRAIGHT_DRAW[mask] and not STRAIGHT_DRAW[board_mask]
-    if flush_draw or straight_draw:
-        if value >= PAIR_SIXES:
-            return max(value, TWO_PAIR)
-        return max(value, PAIR_TENS if flush_draw else PAIR_SIXES)
-    return value
-
-
-# ---------------------------------------------------------------- preflop classes
-
-def hand_class(a, b):
-    ra, rb = a >> 2, b >> 2
-    if ra < rb:
-        ra, rb = rb, ra
-    if ra == rb or (a & 3) != (b & 3):
-        return rb * 13 + ra  # pairs on the diagonal, offsuit below it
-    return ra * 13 + rb  # suited above it
-
-
-COMBOS = [(a, b) for a in range(52) for b in range(a + 1, 52)]
-CLASS_COMBOS = [[] for _ in range(169)]
-for _a, _b in COMBOS:
-    CLASS_COMBOS[hand_class(_a, _b)].append((_a, _b))
-CLASSES = [c for c in range(169) if CLASS_COMBOS[c]]
-
-MAX_OPPONENTS_TABLE = 9
-P_BUCKETS = (0.02, 0.04, 0.07, 0.10, 0.14, 0.19, 0.25, 0.32, 0.40, 0.50, 0.62, 0.76, 1.0)
-
-# --- tables (written by bench/gen_tables.py) ---
-EQV_DATA = (
-    "498325326344346336381388416436469513545371544354368360358377409418453477515554374382560379378380"
-    "395406440457493522565379398410609409395414425436476491542590387386420429624417430455456478503544"
-    "576381401419431467672448469477487520560590403405425447462479694484505520546564584433434435444468"
-    "493501728527534545569610446466460484485502517537752552566604631466489477504501526538552572774586"
-    "599639505512508525532538561585598612810619650525538565544565580576604614615630831661584582595600"
-    "597615631618649658660670844312194207222206200221226247255279311362239334221247222228220241261275"
-    "293310362254263360253247249256241266277307326362256274278399265267256265272293324355372250274283"
-    "310432284282289289304337348382249269283294318467303308310315325375391253259286300322335504323325"
-    "348352369416270285283303325331363535365366376386419290299307299342336360399578394412421439309301"
-    "318337338352381410414616419442447315341344356358357384408426431651449478352369366381375384392432"
-    "449462476685475380393406421402423443451490485499505736223138146159154143160164168183200217259176"
-    "237160175164154153174189193202219265194206253191184172174178194189220240279194198229290200198195"
-    "196196206230239278182204226235325216210200210207225243266181198217226256341240235232228245258283"
-    "187195216235257265386249261252264278294203215209238257270285397271275280300312211227216235257267"
-    "296316444310318320334230231228249250272301310333491321338351244253252268268276304324337351537348"
-    "376252270272290274294311333356373380590387292305316314310333329351376375391415634174114115128103"
-    "110111123131133156179199150195126138129125118128136152163166208149165214151146139132137141150165"
-    "176209160166193225165147159152150160171184211154167182194244163175170165161180199209142167174195"
-    "206263189180186196187206219158157181194208220297202192205199215236155167176180194229226330235218"
-    "227227238181181181185210227243252361248250265276183188199195195222238262280400271275283202199209"
-    "208220233243258298309450295295206221224235233237249273299317318494323236250249265249254268281304"
-    "310332350556154093094098086089089095109112125138166134168108111109089101103111119124149171126145"
-    "174125115118108106113123135146173134149163177136123124116113128146151186136148161169201144141135"
-    "130137142158168133140149162165225156151153148157168190135141148161180193248162168175173173194139"
-    "140144155171192192260194188190185201146156152160170185214223295218211219237153161162172165186206"
-    "223244334224233239166173174178183181202225259262381250260181188198202203210223234257264275420273"
-    "214223217233212220246233267280288313500139074078086082068078084090094111118136113149096096088088"
-    "078085086102106119143133125153111100096096085095100110119142135141148167118115107098089110110120"
-    "155112132138154184124119111109116118133145114118134150157191128131123126126144151122120127140154"
-    "169205137143137142139147125126127133154171178218169156160160166127128141144149166184201254179193"
-    "182192134134146140150163177191219297196200213145149159153168168180198225234327217226161160164175"
-    "178179179203229242253377246178189191197190196199203230253259280431126070072067070062065067074080"
-    "087103114101137075082079078062069087084090109123115116135098096081082071086085090107131122130136"
-    "153106093086082085087101111130104111131141152102102100092093102112113097119124130147170107112104"
-    "107101114133107099116128139151184124122126118122139114110105126139148157197136138135147147119119"
-    "121124134148163179219163171167165126126127127124148163177199243179180182133139130138142147168178"
-    "201212285186192150143152145158160162184209199229335206160179179173170170188188208220228255387120"
-    "064068066065048053062068072080086109095130073087076058056065062072077089102106114125085085075074"
-    "063072072082091112108117125136092083089074076078082090107096107123124140096091094085081086097107"
-    "091105122120137148107099093088095106111090098115121131141151108109111106102124106096102115122128"
-    "135179134117122119127103110117110117134153151199143151147155106121114119119126140165178216152151"
-    "160122124124119129134145159178192249167176138128137142132145152174178192207290189145156156163149"
-    "157170170184196221226337120053058061052046048053059059069075091093117071074067059048054060060070"
-    "077094098099123085078068065051060060072080100103112119123086079070065064065071087098096100106115"
-    "129085085077066065078085097086099107122117140093086087079082089103089093097112124123146092099090"
-    "095089106093091093101119128136154114113097106113101107101108114121139154163130129132130106104110"
-    "112109115136147171202134145136110120114113112128132141167173212145153119121123124128129138143167"
-    "171185265170136140136143144148144151176184192199297"
+# sid - Agent Hold'em entry. Source is packed on purpose; the engine only needs Agent().
+import base64 as _b85, zlib as _zz
+_SRC = (
+    "c-pMJ`I6g8b1(S6o`P2nkGntWh}aj|#}feeeP0!d4iErAkRSj8;A(#l;{PUMV&=j8B$Jr{*lbDX+BfF*=|h1)Em@hr+^VWk|4@is>s!I_3x;"
+    "KciF>vS+rYE_$vzYe$M%!2pZ?*~KNPBGJGvEO+eiwIox}yB5S@JA^_@Z(1sm713+t2XC525C916+SE*NIw27X*{lR{$b?f4tCdMN~(#P;#t2"
+    "D*s9K*OftdGVJ*5EUZBjcsT-DcFX&g?8<Y7lZ}RKHJ`xkF}{1eBHp8xDY3Xx&Hzqu&5L~UjvEIwgKfMq6S;~T9|Bu7_KAxc(Q%dh0c;w1P%I"
+    "00KNMT+;}n4K_*-Hh_}HR?%6c<Ewyg|fzUFPwqT%G0C_-_fr6*H*=WRn1Tv{^T(APT;Rng<*MbHm%>WwoPlq+o7{dQp7n+WZTTJ6PoPY~3n9"
+    "##JI8f7wEMgE0|DUn*ixpge$4D7IhhZm3PP{cjyKn&FQ(DqazCOelgeaSW8zXQ0LTm<+4K4TubL)m_bI7!{9Vdmrx3M4+VOuE{2AO040U!h)"
+    "C1nPO@RUF!z*;xCfymb$3^opM0EQo5>?p<#F1F_tPQC@hH3|pU^W2mVNSpRST3C@fFbdtkPwYb3h`azGX}ErzP_aW`*&g(niEa~Mqp|0jHu4"
+    "-xm|kG+zkd4U9>O33SQxP_3Hi5FhWWR|J=pp6-E-HU5I<hHH46VyU<+r%J3$vIf1nFzn|QYZP;MH4&f6CpsR3QW5N*prj`{zT6fV%%7DnTSA"
+    "&Lblx`1xkDPnQVy62|II03&hpz$eOsLhMvl0?(7p?nc2VUVCq>}zQIF(~Xm7xuPI9D@M^!U4|g*H4pauUh!C@Nb`K7@xltn6K)W!e`GmA|Jj"
+    "@qLcmiPoG9wuRVrh-#>Go;VF+F0)B}2A>oIN9}0e`_`x#x*}{(@ezfsJ`}~8Ndh6G)&*)phC8FIgg$M<20|xELNbDEt@b&MX#?$5`D;+<Tjz"
+    "5<E{Gb2vfBolw{6GKsAOG)v{>T6Q8LEByWZ4_igg4iEN$hL#`t4Hzej=NcIV0jbKKcIb5BA58!rux)p;*ZJOCR9<PblI){(t^}%m5lj5=4k#"
+    "q6<X>*xG0P#-I>i3nRQ?1}7iXGz8(NMu#t~QEyTEsRn8umd{IKA!t{4FNRMuw2?u&xXCs+fsO&pPVpA|Mvb*xGbwmMus?;Up@_WrbU38SvIn"
+    "@_Kr2RVlsjAamwzd|@IdX0S@_p~EpV@|BnuM-L8|p4a<4x=jh{*jY3cu?!2d<zk^WvdYxTF~YMtr0@upQOP@K8)@KY%K18Olc!FSiF6`;!^`"
+    "iBEpDP(YjhMU+2Tmcr6t{ZvrtVz8&8B?1I{A8ecGr?fIm;fs$h(KqN6>)|hQgEn{Kc$-l$tQ}lvd`sT(hC@;@LKry!V9(e-ThH;!8d{F@N7T"
+    "5_gb($P)+9b8LU(}r!G#wXMkaOOM>v_V8r{ZJES5(gP7C7a$gGkm%<<H6Fp!maky(1e~9f^<qx3hQ3NQWW<hLF`nB-qpZM>46HjzO-A_MNfu"
+    "@=42fLu^KizwxCT)g)9_t@$KG02Yir#|F+XhV6^FS|P3xi9H$axxw2d)rVfd4*NpuYY9)%yMu0Y9GmGyL1j+Vyk#FRx!osa`&_pI;0A`X?wA"
+    "wn}Yg9lrvB<H<;C)*F+zNq>NZ{3MkW#fNu76jmkW$g5RG+MMcr9OPfsOTjwRI@2l*8;un{`h>;belGtl7YdH+?eO!6#CHK8wb0=6XuiK4emr"
+    "A=ia;&qBLbc%!Wz&>sy50O7!*|b@eU{i^nb6i2$dsZLG%&Ef3SpOqUV5iA_7sdKfZqxf4t^!fzZSC-$+$nQoEQj0^*Js0#sz&f7N(e?|bwkW"
+    "dUIVhW^kms+qO-J|rsk?|&8uhY{UAo(wDgsmGj-=YCK<gtW6H!l2>5SA|cjgoYdacdKwea#Rp)@6;cm0lEdS`dKqmvB)5nBPr7F`-uww1DXJ"
+    "7u$k21UOF0dJuhh6=qsQPcmxd)-A`5tWkV(Yk^~7z0Ec!ku4z->*>6Zt+ECW(Z?KG#d5rs4Ab;pWz%CxZ&4=*6LL`qZ{8xNRfKS|eC&-+16i"
+    "6HQ-ktHKu!bJ#8T9xiyJG*MZ@}?)tny!VZ;(vra{W<a)c$+_;Zx_o?-JDJd-z}V7eXiej}P7~t<8MN%YM*eOb@M8mtQi3P?CW0-{0wL7W3q0"
+    "kmWzoZLEDUygj+mFCgs1fOHTdm?xYeQ5e^NI<WjllSKG{DnA*>hwzbx@6Z|<tKXQK-?+!et)C*A0}KtoCWG6hE?<F#&p!Hnkl&G7?9u%2@G("
+    "rRm<<&!O&Ts-Kq!^RYFO&^^_{w(+GSGSQG*~5{QV#*8a9Y#(9xPb9Qg<FJRCKKlsP*v_xwVES^N~3P@wkUfbdZ!FE3Oa?K*{w_zeO^u<+vRZ"
+    "{+d8D*wV`BH&j6VmE0diqgj(el7EC%SZZm^T+REo@d|nZeFs7OvaKd+RxaLjTVKIb{&6kD!(I}1PN5MpQ%Wz!tL?nHV!MhU3dh^$h!CN_E&T"
+    "Fm-2cZ3W=N$4`Z6l`)>oSIeK_%G&dPwKzH%c+oakXKc1s)fKUM4D+|}`qtv*$sD3Oa{8TLEAjDI)?<Ct7G-~i00G$~h{{e(#*=b%wgZM(}O~"
+    "HzcOPr@MG&evq6gU`yJ!CaFEmJtSmgUiu6qvWvq|k)PpYIlwy896D|0L08^PSR0Kt<=4)_`w0(|!>^8qU8<^v|@vw~x@sV4gnuB@!Xf(6jgE"
+    "pIiBWlJ|$d!uxk56tS-HBmH;%<1fhhcWebp(Z5-#6j~?=D2t)>FS`9uY>a%;0O94i?_Uf4OBRF2&juuwz$5C;di)Syr|L;v_(Ag1v-fd46zP"
+    "d}?CrVf59aD2;CDd(Hao&#CBtV9h1XAiUFKbhKGH(@;ColUO$`4xOi<+WsHSJcu^p#ch&uL0cSsNODHOPlFgP(NWye4T|NZoEu^_T&{RI2Ge"
+    "6+@F`l%e|mTTnpi;>!9h!|ehboq<cKtc5O07|F`Mj#D-Gj+FI!wG!!_`zmF&Sq^>CYU_43o7PKtg#6!h*n{ZQ=m}v)2DL3tM_T1D;;n)qxL)"
+    "-LATcLw~W*a(>z7Fqm9RJ?~Q!_L8afG5)KJ+(ll*@4&JDpw0t_?=N7&{u|F;S`s1q+hPH3L<TqZ^KFOwjH-8Q_us3A&hgMCT)9PxAxBg(z?^"
+    "Sz~@!LexJD6Fjp9XLGwA`-JtjG)Vl>zC(r$C=FezFXG(j8XCPfo;7o=OVzRHRRd?#K|jvtJ>sNI{xU`Mz8tH^FK8^$kSjo7<9O`)}#Pui@<#"
+    "%YLd3XKxj4q9HBBozH@*@SMnV5-$k6Ao0A!D=e=l0xJo;BuJ{r@}eN}GAlv>5$-9x#PFiR%d)_z0;|A7L6${U6yd2X@CqkF0a@i`g;$u*X*a"
+    "wo3XCKOj3CN_%8MKn60wj9JuwnA#Hd(?6$B1D5oAeFp-WCw8D5cjMG`nh;8ckd1Qt4hc7Q4<rieg{AY|Q$GLkPatiY-Q&kB+($xuUqaR7~iB"
+    "8waY)Ip;H!wU?yF9@;#t;#ACfr26<Vi`e##zh5&%nLjX9DXF_bIvqgWLTL~L{5g$10|xQN-P6K1POi_Xh={*k>NxZ3IKOFXjPOXcp@QLlAs_"
+    "#A`F9JMGjb@U;&u}B1J{YN296|Fa;=LIgwGY5tNl8N~{RwRYhVs1-Qqm5){Ix@Cf)K;HSa>Gq6ACjuj=IQFvCuiqHXY6}Z4Wx{;{_E3v?4Xi"
+    "I^5lFZ=fSq>P<F){}~jKnbv$FUrT{K64|{8*NkIF46=PxwfnlAHpiIf3PXKv~SX;h+r5U}<1G0*yi3K?Okt)=+5)#?Lb{q7jS1SAhc*sVZ=Y"
+    "14+UixPUI8DGr1Jtc79>7E|~fX&?q3C=iecMTK7g3(w2E0C426GYM|;9O46T0sZmB8-{0zyC5%>Mao1d25e)XF&?_YR-xB?G}xTT@c<eY$Yc"
+    "--3Xg3;RUUZ4i|`-FRg!qbqy&KEREAT58W}$Y4pj{lMO8%{BEXsxI932of+jHRV>AlV&QoWAY#1EM6Pp7~0qi2x0!t8;P%A~y6;Lx6KIktii"
+    "J(w`w2W4y2DBT7s6a=+K`sY06hfg&k|GND80g|rVSyqLBuB;p+5)|S0xDusCb_dn6rcxnmBkJjq)k$QYy=DF2t1N=KyzS5pad8TC<GNm9(0*"
+    "iR91!303Vby;Y|WAvMLJ#f)=ohtgvWnRKgVqT*a>{$dkCrFmTPPxokim;1^rr8Gt50h($mO2wWZ|%Yn>Th6rQ`+#>P<v_oOBQRov&0zXkE&;"
+    "sy|FfD+NDep*Q6&d=(ws_KA)MAMM2Ka#%5W5_XhUY-X8I?oRD5qfIRk%Rq;DFVDF;FTN{+FLxlOKA6swto{GCc7Wbqz<x5>YB?0Nh})06bG!"
+    "=#U@-<O>94phm%8fFk0U^Z_h3X+@4SS;BHML;6KJg(|}0+5oTuG03FG7<kSzARn}3X_uf)&>RAtv`1ixcOW*nWJNMk52mp+V~ohbwxJ}8!UX"
+    "()3`MjUfG7?%5TuVac|aG3eSvjg0BkCNn!_$w1RkFbR;G>sdk+Y}Xc(2?C?UF_In)K2kjha}z##$*_>NGNWWWew4-^qP1BlAl9N0uw0m@Wt4"
+    "a!0>7}f)6h%qP)2!=umq7FcTHvzn&!iq8>3LroR5oFFF$ics0i!ACSxJ_zQqHY8PG#W=j9h=Jrfq^1cu(|A4MC`&%0mTdLaDswBK>G-70Zj^"
+    "W6<7)og&)8k=&J&LkI8|@6E!%p$7qO5vaN`82o1n7L!;0H{KBx%_zR>EU<}D}gRur{#>!|+RWy-63(_Hw%|>tv2t1G@BfMK^td4#ShL4V)+`"
+    "qyo5~Ha23seKU!S{gJV9+2!o{S2}AAT4tgD?Vhz#jmMfVcp00(^vb2nd8C0un=h5-^9r6A?K;F;CS{+A_in6$)UK7E8?<i$aA*f`YffaX_yC"
+    "5Gchzx<SR05gQ<Ipb;>Q@rQ~gM#4A;A&zA5*a{#5%BTzx!Dj8E<bmf3RZ$3g#8EJDd@dVmR6w-AFjYd4#E?y-<^T>1n|gXu7Y5;r7y(4_C_F"
+    "?rI&(C^sJkq7hUP|uA%bWhNCQFya^?aFSw-&4d}f0YS1g)pz#RBT2_Z?SV+fN9T2FY27LUQEpdB=2U<m;R0KD7^WOM-m&<D$rRhRG@oV)_|Q"
+    "9&tzRp(U(qD(o322iQcHGqY|&=Y^iK!Cu&HK`K*Do`NT8!8Qv6NF|Q$zMf_1rkE35O^3SuO<@e7_v{K>hBVgN#o$DOej^U3<G?~Wdl+H-l8E"
+    "=(3U6y0ZC24N{C8vA(BB<5O^5($yfwcgX|%?4T)roo&Z`0Ek&t|x!w@|L;@S1K@N?rjH97Qi|na@00GAX-AF3JL1Hp9h<dNkm{QzJX#JoUtb"
+    "#81;nol)EJYQFC?tW&v_vHcsWQ1&;3<s>19g=^MGAmuRuCW%Iio{EXG(aZ&_I4yPX)V`RYVI|JpcqmPBIu3iIAoubFe3d+&LBFnLIFK&@}<<"
+    "WQIX|E8_*iSfp!+e{$I{;H1$`2q-fio{0z~Sw(1I1+XP@iYOEnhymFzA^Jenhzpj=vxGpAipeA}juc;dK!B$-hR=|SsFPDyhvgUoE1&v9j?l"
+    ";v_Q3e^cny4oa;ltJGpGV`m8mm$^e~<H9UB!;)CfmH7eYuSV@1G2@DSuU0togA4W+(S&5V#r77v3#@`?g=%sz|_5|qkcA<3h`p$itZK@u~tk"
+    "|!bStK<N|s1oIh{t%-O^3V*0i5zx=_U+-;7&P$^4Uy|4uMCyZXo+M@8MIM|Q4A0$=tn0+#!aPP9$AEj4)CI6-U~t^OoZfj^@K1MEe9qw5XD0"
+    "j!;|C{M2^Ccbs(1maTsI+00$W|L<RFigcHVxj4YGONsWk*W@GpZXp)6TH#`+ZI#BCTZeTV@Jt5EsQG+{GQiCRuW#UpeF_=2anfnn^gT$gs#6"
+    "AdkAT1^j2eD}sCRqry0!j)5!k$7#OiG<3Aef@B2k=;OgQ-~}lgOpHH(j%7o65tjiO6Dr0FHnoT&9}D;GOi7rw|_6RmrfTd6Ur?LhBr%lt4vh"
+    "je;pOOXQzK_F>Z)>NdBS9CeBES1IPlge{AY_%s|$?OuwJM{2+!-_Z@Kbf4THhNllei*gPX0c{s0v0!b0hX@CdHt+zzMX5X8QSle714tN!0pp"
+    "fY_ds}HU~v8biorF5zw!fVfRi+oQPGwVLKMOt1UqbA8c~Oy2AP>MmaGQaB!(a-;3t|KIW<C57=-#ToiNl4e{u%v)X}Ljp+zM)aVQ~#Q)-iB>"
+    ";RPno)Qk#)ZV1b$4LpYMsWWz8c6f7G?}%O2}~MprBQhr-cu`SY=vHt>=WW%AmCA62$BF3z@?!&4F&Dt!+WBlsE9udv}A-E!(}Ky-;Rzp?TLt"
+    "0Ncd!jWQ-k1;5?DVW;(=C27x9Ae3Ja|Hxx8W6xj2GNc`l<8!DOK#n4%x@Cv=$=TEPns>9JwGiGSogcR=##S&yI)36-FR7&{JMxjxn{D$l+lw"
+    "@;PkA7N46a!~~t19IVn0KNAJrq#Nk|4w$WefOCL8A#xs8j*!gP|12)T5^I)Tm4bm~1PHX)!g;ka}_y`XbkI8!WPE%#ayl;G;?o7#Jm{o}U6f"
+    "i4<5&(-d^fsKhGzb4qm5#FVoAG>An91li9+0nveD#*Q(kNcJ44LZ&NOAex$SWW7ihl+rVmo=K_l;#?Zd2*@;FKxP0+;+)>YqX;;+L)4K;ARc"
+    "A;JkI_=dX74dlS(){kWM@)7@*=5n?Ru~n<nWzM#v1#QmG<M$p~N-9w|AhAovSR?{NYZk{+-IU=vsjUlcY&kxcRjR>)jNFUG_Q`b>y-plQT5l"
+    "1p46w}#UXk0=@99YIDk!#FVZ5lB2BTao%uvn&$Y5+I+GC>`WzC<@+Z(=3p<#M68nj8CCx1H2^vU>Z&jP`lW98k^u80QM(S?u($synv%A6cSh"
+    "JYk6|Fz&9le(lEgwYM{I<QL#ri#3pJYttn*PU?M5g)C@@i@_dXe6r8`q@|cp-)CurSrpY@<P$UjDRG~=^k>;--(<Mlbm`!<r+F`B<ED=zK9A"
+    "!2*uPEU-pe^VR*o(7{3{GMQstAn=L<-J5!czq&L%?vPB4^*{|8R;AC#o4BM<!a(nBX9RUHBC<IA{@vhv^M^0thQ<=7u3O5=vnxd}_BSe}~|f"
+    "4D5S12uBzYfEA|zSYo40aWG5SzJlX`)Eh}o;VV*eB6ge3m`dqXwMsKh43B9$!Cm5>Ab`Ij&Hu;<Yn-N%C^^B|e&Q0343U^@eoLWW>_DX%A++"
+    "*55~SiUzzkXth^9v{PJOD#eKn;8rva&(e98$YYzgr=7pxM=98PiaIR8#+NOzzv=o98MB1%Z%Q>Nxj1EC8FT4$O!N{u3p3B@RIX($Qw0!VR|4"
+    "ClgmoDRYHSfl{wX)`fVDhlOPoNNZz!T*oUA6mj8GicdK_#*a%^RW_5#zIN-&jO4Uc_-jR8I(r%Aj30W5XowQ>ybq4Ul7o7C^U5TSvHjNfD+&"
+    "gxIzLzu%U}nQ<$pwiFN>Iqp%o=K@n)eodybq8be!^*vk;^(Nw2O_ONLJK{nL`4(EwdRwyJGnK*=BVTdZ)MC2`U5Jjje8DkM<5{Xbo5=op$1p"
+    "inF;&67F^g}@!WlH!-T}YBlHnoT%1Pn{4;TSlxxb~xB#80#GEQtp*0;G!vVKY3rzsDRCi{E)6TXjIdpkv@^P6E-vBd6$B<YltrEcH$EVpJD|"
+    "E%TBhD&$rXfhqh@uOCRmB@9%16gLW-M~Q<{V;o2QvDg8U#vs^`U$`=WGp`t*sUkoe8P3pxf<VN{v}ynm$^&UY1&mSU6#;@nA)Pixv4bR0?fF"
+    "cr<aElJN1KA~mL=aMlSs&_qKi<eIw_M(pyz~VK+A|L)CVT}m6eP+l0Y~HVxcyz)39u67O4Z3Tp~0|#*`t@1F=HNAt?5aG_qG|A(Svjb~Bx6#"
+    "w9eYiK{XcHNwb2a#9Lqh4e&1K8q+0vbJ(+bMYzq6X^i~TJ)l6KCrvItfCj7g#}twVFYyP0!drU)f3GqSOHOHs3P2u1rQ8IduqD=LwLg_&%7I"
+    "43gvK;8JA8uF<mf1#h_JHj@EAkT+l-CtC&6@6_~*bXjhOpg??FDUKKD$2Q-KPb`bfa8x>Ly1|12Ig%`BM338M%DHde~Cn*6wpp!B!eW|ntCZ"
+    "|?aCRI;Yvlw21p+G<BY7}S{$TZg*LQ$r`<nM54itH75T^27W;>S7|WOJnU>8i0xvcXiBrt%bIDRP*}6c*+C05n50oVauhzE&0#TCd>9TGNCH"
+    "Jq4df{b4pho>U@ZDv+tg>|a2b00&fJb!NJNn1_1Gh(4r_<1-;=lhkYqd>jz2WXb3UQ1wzEC|FFO1wWedB)o{UhQ{Gat%~h{<9NtM5Ytu5bTN"
+    "*nm2{EG*W&==3Vh;F5y%RSo1rF1;h|An0>mj&Ns)2&7K{QyM#4E7`Qg?S3`cQM5myTpoSMV@l%sh(;6=LThl0g*cKE^NZWY&pRb1FtMC1lpQ"
+    "jydvjb3?jCF=Y1JjxU5qj81YO3d_*Y&N+?GQBk2gIr>1aZ<nqdjvWPk1RieiWVnX^n^Iu3nK<bJXUBRG(aQIrmkBia!CHPjz}hzxF?ZqM@=N"
+    "f!txBNAt*D!67>`X15MMShCq&$d&q_((~FDZq~Nrei?$ZYl|^hfo$4f0EeS{#j)@k%P=qR#1TTO<P1iv||1h{9r|@tDw4|FVFbb1JSB%T8&^"
+    "U-*BDz>AhMpd+B>aLPF|VR109XA|>`57Y*c!%q{A0-xbzWp86*UGURfXUH{UIk(1B3HrD16)*A;>tJz+u<IV{-zBJ0VnD8vtO4DnuI)e=rJi"
+    "NO)SRr^p)30|reZ#Wx%oU<Ua|)>25VGOD3Mo{?mOevg!2pzRYlASDwv8b*vjpSuw$iby3SWI7?qnV#bmvXY@FHK}MzIaD<ijEsWeNLP@zsiv"
+    "nYrM~ahARA2F1goxq`pU>OK_;;?_$kv8If5*OsY(mrP>>^OsoC1PO5wXeE1s#GP{5BhbU=kln`2}m6N6;(>NpG<jhrsMqqG4fC=s;tk|+^60"
+    "Bl0OgfC^qXvGnkAUrYx5gm$5i}@UFx1qf@Dz0whOa=rFAWPa5@>u8RRVm##fCd8Rdr96r*$!OzM<+rXZa_|ty(c(dfV`sJA(Yfh02+i4DmJ="
+    "Dfz}1H*o=$<jTNMhvmL6Srn3U6@ny30>GY2H2nQ7)hd7V>f&^p&pH^eDd<xw#ZlQq`k?aQ<V1{%^5c2p-$$~E!sFKQ+N8UV=LJ?)BlC@wmA="
+    "6X<;*ukSK^vM7PO_5exk$nTD57y7>wq4JHZ3U}PR^=ixzRd2l0p=NnC}FkEmb1=e556{2-*H5&|(F*OW{5dA%`+NN*%lcT&4|7JnqK9AXg;x"
+    "O7Bbch&<dJ#NbvBkckQ{Vtj*hby6z%RQL+=1ov;qwCf1Qh?^ZGmNs~B>250)O$Jm3=>q5<DK1h5X)B^p!l`*hqWwy=)r+(PC&^XJ@+Bkzx&t"
+    "8z6j8{j%*n4%dc@LL$zLEYa60r6s&izS+0=xHdE^cfQjl<!f@28Dz<5B2l-e9nEGFF*!=Qu!h%9=9)Zn7a7iq_f$UY|?3Qs$vF#2LdLI`bH0"
+    "56H5S88}j2L+M@gx{GHQd1j@i+i-2i^5L{Z-UR3RMK|tDI-894Q^jWJ!j-hwkk0i!wiPTA*a&^BqRvxQ8Q_ioJy;6BKm?fG7(ck1>8i$JmsF"
+    "WvyDyr$A|=X+yT-QutP{bOECi4d`4zO)OlVZu?w`dhoe10JVub{5m@vHxIinSiu1W_5P~3d0jDp}PAG&(p6mi{W)U%)#O3XD0zt$*J-E>go-"
+    "?9?liIkC2AmMO5!@0-CO{(jDNj2B7)nQY3WZhl1SBDu^qfUCO!MY+;{fiP5^)5y>5aI=pckM`C&*Zij0p0L!#zw=?mcl<N+5TM%11I6)YL&?"
+    "HJLVGL7E^CIwT5|L9fs*kZZ^NW@vCxX%J=tIS~aF4rQZ0_S3QGk8w8)Zb2Y<$`}Hq{*6kLdB=r!a@ZV&bF^PjO8ttEMt&Ievm)vgNSGxT`It"
+    "-rHAZ8F&=e7!GVuiaLnkkRX^?3DfdC*Bvt5yxIEdK}OHf7_imJ*uRV3j&4$Zz%1cSM54go--Oe26m1@u#(-GY$EVB`&cNuiC7WEyY>6vVC)*"
+    "#!m@5)5uol4w;#F58)i`hzQA5{ufGb(7ChF@ln&*bk#XAqPk5rr=f@gffPSX%s8b?kpZ-PmVl7$_6xe&?AL#GOB%!G>PKwH0;AIbu#&2+WAT"
+    "GA9;S{2E|sXl48_=$_sc0ACEDON+uYv3UMKe7ibqi-yfMYj~hKHqf7Hu^hIQeX;K+vllo)mStiD2E`Wf8<^a<V<S9x*!sQ87O4q5#Vm*uv`Z"
+    "|X80t&R(RYXyNJkXYdkZ5}??v$Xtd?<5)R=8MNrDJiItDLUnD73d%MNXi5P%-9tcLW?JpCY&{G!`nA;IR;z0}**byIe&uMG8)>Q&1^l@Jx#j"
+    "v;hs#jlU3o!BbqdmJ|#;L6dXY;A4O)i~`uMs+hGPLPUZF<jt7hQrs<*3zx}Wq&qAXWF~G0#w}zx|B02<EVq&<m{uOfMj@EPAVB6oAe5%`7IS"
+    "{uV?_}YpYa6PrKb9khGdu+i6|kGUy3x;1l$;jyMg8R{d97=xfvIsP~&hq43!B?50J^=z%i-7;0;$XX>YV7p^VUtQamQmoGgi5rC<>ON*+qi)"
+    "f0CuLwz+1=`d1INrCZ~!7a=vCl>cba58NoMt4Wkh$8xYivDSmgElDv=g_v(&MXLq9`gbaPNJ<tgQ-#oz^AOkUD&ufi*XaGG=f#2hFA)#_-to"
+    "0m?FdlBdfS@h29XKvbfn4_gO!JThIo~Y;eyJuF;d10G{9!xI(*3pgwLlq5`Z!tEHGPOSmma!3Dc?Q@o9TsFZGu$9?bk2A1Q=_1tyjo(_eL8^"
+    "y^VuAjbWreJQ3C@H+qD|9-6WBC7sZ&2~hcJ%r!D-uS*+E_ya$*pjOQRCkQK%?L3^(+y-0cPt$m+aTC9Q)%ty=H{|p2&3y>-1G4fnONlUy#*D"
+    "&B_n@Lxl7%Lw<by^tey&ZurXJ{(kXGfx{~fuXw!T@k+oe0k1^767fpHD+#Y;ypr)s!7Bx?RJ>C0ie;#2Hv9819{$Ha6~ia^Cj~P6kAGpNLZ{"
+    "d<l;Pkx2hTXT&oe(#LO-sC+Px_8ho|MNJD)lIGpBa%m#RCzI7dg>Xw%+#yDYbYsJ-==ouQBP-eB7u^_=B(yg6NW)7z-K_nqyraw`Xi_O`yOY"
+    "g}{H^`%xha?2N{o&jUizTKvyUai*9hl|}{vY8Alm0$6`EgdEQXdeC3**g2z&0=t1*Cn5g*onHaMe)95S#!0p2F||T5Kq-ki7_{)#=zMrO1JB"
+    "@HCb9pr%Kk1HVuPmtyvBYPwnmI*UBEgx0*52WQwKHVxz00t9G8Qg7(OrJI6p?YU6r1z6`rcqTOa!O<`&re?M}%rFHnFR4I<Mv8o#SVBQw5mq"
+    "pf%)k$RNre*Jk%YIi0rsh2e`bS4^49fAo)>4<3ak(10TJ^XL`senrVUC<@iw~;jT75iondUv(>8&19<1J^^YEP@}itn~msp(lvbL!>`_)Sw!"
+    "X6$eoc1FWc>upYFW9(HXT_LWF58L6?SsORUOeW3AqRrG>9jokfMy1-4hEiLvR}AmEEgE`N^M|VDy4UjM7+#ICDqI@Iq7^i=ZuDilr`LsEn`w"
+    "kXg<sUioL+TYY3Ed>+pJZ0hx?!{4XT5=b21L?itV+XT7Q37s^v8_SFPB=ebHPFz22_h)<(%Tu<dpe7;EW+xT>AAZhAw#Hx{(9F{_mI+k!car"
+    ">$G$mv2G6ENPchyS?xCkIkXgZ&!LDkhvXP76*RFFswF~)pq$j+FAQnB%G(wTD)!BMni44YlB6tb?uMLB<sdy^;vmQ8jKq8WO(RT;!DpQ);zh"
+    "ko_F?L$##cq+o<VfzgR1^*XNUXSM1B~Jc`EGwpi6#$%NZ>JipjdXIj~gj^p9vI1}1)?W|tr-s3M-bZxrWXhyKOi0!*?8&k8fDS9=R>DKpkcY"
+    "D?Q;o>%SEUzZti{c7u>&9T{Y230t*$tYD*7(MC^l5iiiv>fxcJ*Vq+OV9eKUzjiO*mxT)W?fk&>c>#W)My5&1Uh?Ew<a9#Jc^8e;kUV%iNJ!"
+    "M;GnlDyi1k%9$|(M{Qel&7ZlJr4HG$Td5w6V^BF=w5BH-TBq#QceS#6&ARDVH?^RDwa(i~FqYc0quU!conCw0?4Pcej>=csL9<g_7kfK7VeE"
+    "Ue?;L9fH>$GwrqP&I1D!j#{Awa^lzx2K7^C4$YF#wT+E2Y>&8p^Jh&i0YN==(>I`X7-(5tpM=#(m;)8SH+c<mf$LvLrgax*!u#FHbOuf@4`D"
+    "GEZnEVSFrVfDN{@@?m;Hv(QhIAP^};jHo6h}WxIxXr_=`(!bR!o%Dt*Mqy!^Cum@soJ#z*V+v4{H|U%PXpO&97b2J&36NJe{q?0<LsJ}+iFe"
+    "yy6#SycD>$Q^jj6*4i~W;&W9Vzb2_cK;Wu(XgWW6DE}?#Bwc2`CoQy7=qlde$!fC&Da-4Oo=ax&8`D}V0+K$1ljKzJo-7!0_zYGRLY1O=}!&"
+    "$dx=~7tU2kz{C6qTSM^ULaZZRuv#jcMIo#+&l}q^wu>VMFjDZ+~}%@G8dB%5mr2+GXpw@1MeDuOAK)|F|0VwBk^zURz4rGY7NUrgz$I+N-F+"
+    "-uHU66noB9)(@H~b3xO|x~Yw=VKCl{{r%As*lA-i)4Hv_+2leyu^QX6pnB83%a-LqacEYHy-1(84QYNq>27yl>q^pctBIo3b5&Pp$;Gx^YDX"
+    "v6Y6Sho@_yTPvTkC}jQTT98yuDHc<VY0dmU`G!78ZEIeE00M!kkLIBl=jaiymv{K>pG+t;FWQrKAMT&L0Asil$72y}liyqss->9x+R0{42A?"
+    "j4is&9iQnt6|Yi&clulX~j}%cDDS1kJy83ueFZMH#?gX_#C6F+s=)@7w6y;Zp%{F5e#k?^oG>|a}*Ahe&Y1>OR;ht4v)w39t={ebzmA-F3SB"
+    "47h1!v+gwze#maJU4=!DAdaN+lbH4)mJP?<?Vsht=x}e)Na21uX(rP#Ndb?IFPpmGpTo;@6qIR3G$+A9TMtZVej(451y;iRM^Cs6DZNl}-o3"
+    "LD}R``HB9Hy;Kw>EY<+~rj6-^SB>JPBGgZ&O~K8;7X8IcZC4za6!DUO3tBAt?c65?9xt#`pA%Vh*cqo*SBGFqYecdRxn7<4<D~kTN_RSb1hl"
+    "Cyn`b)Z=EYC^@qA!}eU1D(Z1!CUv81iQ~zt*xe?JowPf^&>NHCBt9>uTAi7k2bZKd2=4b|sD<4X+f@U7)KqqPkT@`lrD?xZ-w#*8&YaeEgJd"
+    "~77pJ$uY*<&O=XSYvm<pkzsnIp@>+^=ltli6b*K2_vJ-4r+f7w+AGg-8zJyWhGi$=XB`y*%DSzf(z9>5<5mQ|cpb*YowxN}u2^D+}nqjFDIn"
+    "RUevMu34MaJ)P+r;A=$HoeA1s!mSTNZ7O%*VgFJ@)TuVEAJ*fy~NZS_o2Uz9fg@(gnMt9tLJK2wr9#zy^r+%yj!$vIb4nIr@7<Y#OtUL^mbw"
+    "pUq(SvS)NPP%K!|_fv+&5*>uk}#|Ni#S?DFjwAF6l%=M-})x4Fo7v##R=cvVTIqT*eU$n(&IT=rk-F&~=tx8~>MYlN|#DXtZXF<2WpL7pZsm"
+    "|Mjcy}_EX2P`lqqQaI%}!)DIwMEn!@y}qwp(%hwspKVm3Fr@5#~}i9%bDaU8}coW~{nyG|!7QqeZgJR`r3a+y;ZAQ!mF>sVZEy*Rps}2VAV#"
+    "+qfo`8@hjAdCUFn?sX@Z#5a2r+i=t>TVfSud*yeNR_o+9N<r35ksYks#kTA!^^sBIZRnzPTGZ#&&Y`%T6pxi8@akc8z3W6m(W@>S=4@%4cQK"
+    "=O2I|!8Ubjj#v@JtV`1;~HNamNSG~aEveyM%$uJnD@P4~Fk8|^()y{b&b?F5W5Oorjf*YxAe+TMbuxp$8yv#TF<wNc&QSU=u(YL&8fVb0Ti-"
+    "*N(Z3|ZphWEuV1=-lhp+>_O|6HP7Kjs9Yob>j`s(t5ZK*uKjM7vp3_x9AvX!u_@gj??R~!usK+*{&{zHK~8^1XJ(i^iM*|h|Sm?EJvpbvy%;"
+    "{(oWia2$`9Ydn!$$@lKbTjcVD*AyAXc>haQ$+<m#usqMbW&mo(Q^hRe|JMEo@T5a&$t~yg%T%w<k)(z~@O7E8XiCwe6XF_gx)*8oMS=DC3Ok"
+    "Q^{Wh>Ztci)MEd$T#snWmN5?l{!8Y}qMKI{osj(Lc;ar&Y5(x`o5yE;$8t+X}{kH5$$3>uEZUO4jv0j0cXsv5K{-F>udJV5<w!RE)`8y~llU"
+    ")*86Vj<U?vbKW1?-ayyXYiq#Ojaygm3?UUWl$E<&)d1xsA?zf<$gf^DGq%IK<wa1c2i}?~Z5?^lc0&08Y3Xscncb~kG+JE_&0`W?XNw^>xjf"
+    "dWhK;e~&%NP}Tg&y~fSC_$XS?QG_Uzi~MTcX1z31b7@4OoHs@;C6I-Z=`i%4kI#j#Ta&nZ+l=j&?U?49pHS1+s4YPP8;y16`Uh9OhUyQz2ig"
+    "Ku1SiYP25+Gx$4YjMM>$l-tsw%q-09}oJ(Z=V}xFFeV`mgV2eNz8Yq;jA&ap0tTy-!>+3V^fd$db45+PKVK*A;_*<liF?$=wh$hUruKyxms`"
+    "3id=2ry29*iT=h<{&}U$AlU=35UM-iM-sY2{-4y&fHw^~m7C&CDP1n05Mg@cc7bPuh$W>ioF8plZT)p0yyX9$A=hTX>0>emcziV6Nmf9??8&"
+    "`I6T`K)ud&V_tVygto$25g@(DTaO=CFQVL4t8*CedQ4@MR^Dxq&}|P;pY-4|?EC{E<4ds-@m|*vRKTZrUvHgjOspTikRulwwuauc|-VMU`g7"
+    "5<{D{%~E|^R|f6DRohQtbOXJ!4*O+(*gMM2^Jsq#c%4^;aK7=m`h9q=>x*r%r_J57RnKM9R1aY=;x;?8Jdls_Zd5Fe*gzCE=V3AsCx`a2?4L"
+    "^ZZaW^Gr%t<OuLJWU>rL;l==auMQW`ZEJy&7wXQ`qeb;xzfw%gYmD>)Way_;KsQXc~5wq7*?@pR`Gt=)RMk!OphQMFV?lTA&pF+ILNYL^tAx"
+    "r~?@-y8OO3u%7oB#X%okiT9X{6>G;HN@6z(&tv;H95FuYupuu%VnH(Gu4L62EPcq+63I{ZF*jn<fhXejZ51i3yGY~*A=eLY{mP1ZInF-;ZAD"
+    "3bPpBXzb5;ttPHH03F_D!Y{ODFxUKFjeRl6@SH|qjo!co-qe64D8I3xUb+c=gqNHyXrpZZ+Q|`3D({^vO)rx6V`)gf}!*g7BYf@*=ua#k0+j"
+    "?BNGC0^F)0#QXrFrgcok60DRk2tzH6hxrxMLo5cE;s0yOb~5rg?7K<Avvfn+d9?ol+j`W0NWMcVLC@1`|kk3!Jm0ZL6}=m4b$Dib;7eiG!t6"
+    "lY`;zJl7Yu)p1m1#@?bW)kK3!>XY1bMtd7V@}XW)r9HUf#Z|G3$!@W`uFso@T{P~KL`#OztUq!M(^Td9ia9V|E!y@+2WA;GhU*>Vk3L%oruE"
+    "X$n@iR_GS{n<Ups}McDZ`qSe@yHvtx2F%*D#{tKLjdZwo`bMcz;<Eic@3&77io(b|poRiRztPt{TAH{IDymn-e=x#Y0@<*2`^uFnf-Vkk=eu"
+    "$$a2l|;BsazJ+_xj8fMLF0C-Y&>hTkL!HnAeVKK4=#N}Z7$vYa8&dId1y@=yM}s^bWezuJ5{I$QL${a*ctenW^pSuyQgi@(w2)^tr4#Ep=s}"
+    "&JokiR#->s<ro%z6><RWdj2QlGh=<uZ7$0t-GPka!=rTWD#7#I{OJSWU-JG^Mar?WoxbC-Ga&usv&7CB%m1(qD+)FhL^74*5S`C%TW0&;IsW"
+    "8p`2}CW<&vTIc;!uvHy0|yhZSOp<@YYpoSgo<!)u!9BSQ7VLrc+#vJFWUwszjA)d29B??d=XOkX4Ir-GFH7+>>fcW>5<AZW_IEv1V;o%low7"
+    "l_P^a9@v&y<S*mFwSS7E;hItS`;-;9`=DP@^}21Y2aa1-ZNAjq-#l)6Y;E>Z+gvR7=Dyac>;fHhhnKH>d8sWLSvR|0yf|$Xx5Yy!*R3`--mF"
+    "yv6x}WztI0+~O*}Z96d(Of@m}c!ycfIHRx3%3u+ww+Qn|xdrRv6Yrs{%I7nNeP9WT$pPL=vn*|YduHvMMZZu|N`k|2d`)s8{KY?sQe$*Itd7"
+    "wt>^?Qjm^bNR?a02b@JZY>&Eu{E?OWp}1+;{KEeD>WPH#d|bjR`tz7GPqsidTS0(mXJ>kRV+;or;TgbV;WL(YZeFXNpD*B)-y>;+Ufv=a0zY"
+    "!7u_Vq;{A!%>~|-=wlxE_VQ9n4Wm>D31*^E8brh*8-`2`r+d#U0UT?-mL(97<de`x&FCLSo0Kp(vJ_pjFVVT3eYHN3I($K=uV&1$|IIpZXmh"
+    "FQS>e@^_Nc!=@McZRTC~oE*&#1X!Wdpfhf9U!5qj_H*!22!5dk%qn%jlX)zvoOOIV|y;?beu2OWd#$t*5(6*922GJ57NQ-Kb1M?yeq!>pZN<"
+    "3wi7`jEPm{?~|e)Dooj~1p{N#a)(xE@XK?*)^90I^Wi<60b6NFt-yi&y3d)@#`&l%+clA`42KYr%aSHf&2v|DcLULwuLjXVYmLe?*_~I}#a="
+    "oud|`Qp)SGMZ{k;I(+ep2DohQ1NocTP4uDFvS$8nYJ`4)gDuBafYp`bMCo^)cTpcADne;F+n`;w5DyX9Fm4E+wd*><t)u5YW*SYEVQ)!#RQ("
+    "NJm}`@QBxHyXR3!Fc_^j*GdI9_s3~ItkfITrG{1i9FmLI9KF`E45mceQVvU)>Wf>4w}B%m2MjEErMjT<a>QixO6(r(XeM3c5Ep1wjEuV9@{Z"
+    "%V^3f=%l+!UpXdHYJQP>r*xiL==XyE&#!)I3d)w-6+$r<N!`K|p2TpMv38ix&mXy=c48@)<7ti&%rB4O6xtk1p>ol(%jLOCg5=-9OG8p;6Iv"
+    "Ea6lYX9iYK_^*J0HT8Ro=zZ3SX^jd{fX*LeRA58pE_EyHU_}tsTz?lSwddw3gHT@B~^pQAbyE>-KIKXK%U7d97QjxLJ>iR!e58+tKORYu~bN"
+    "f>xrdl};^5B&W1AYqITJfkl(u^4`ZV#6DXAc(I`#&!d~hloG3@i9M;hbcJf5odVVgLWk)r8uIP}x^US<lm4)BE;0}?HHA*DH}c$4$LvK?d*&"
+    "g$wfWBW;GFNPQU7pg1Ot0_8gDuvmeC>JC596-OYUY0v&Eq|ON>r)V9pQKQ{~`5L^L^#w1K*p*yvIpG&iez0&Z}YbrZVEbuiw$mSF65`mr?XG"
+    "J>gW#`|%9(K@uNWn1jk=k~3ytHOC#<fgK99fG-ECCAV@jw_2fh-p4HE!j-!=iW$J%YJPathZ`YSkK0nJWdM&W5u<-=Gp4iq)M$j+;zZZ^#bQ"
+    "2NiC7<Z`aOB9xi65{Y7mLF2S%fsaCa;SPDm1+q_>k)#5H%hAyjD<#W|BwlhV%1c}@&UcolziAOw_{AI(FDvVeJ_vo!J#|l?t_rswzSGT2^7O"
+    "^e+uvj>Kt1(eE%^&q^4Rw0G`;~w{R6}rO@^smmm%I8nP=`ada~?I@1OId`@0zxg$Ivaevj`Wp;!PP3`~$0otltJV+^Vkki^F0Vk1PA?d9>~g"
+    "CJRH~Fkbzz^-oge&Wy*a#;U&V%qIKJZmC6Ub9<YvW=qX>c2d(So(^2(RQ0Tz#Vt0Z1_ws0Uo$*&&(!%jB%kNnQL3MgdT+d`@7UY4)@wKFCu="
+    "oxu7O;?h8)RlvkD+Q5tY_hO!~HWE!vex?e$r^TkqL}xTJgeQiK-P<<)9ks&&r?YZgy-LS$CGWbHRXtz5rPR2g`FiXCI$ZQR$~>|U=;G-1|Z>"
+    "WlGdZ%6uN<kY#zc-v@Rcb;-Y8FiwO7$jg9xn!HqKwVU4dOkXy&<{qdO48yhx8o&l&r4%&d`?F9u{~ZN8_Q%HGVH3t2O`@8S7+C^`&ndP6k}A"
+    "}st4y}?!!w_yPM4AU<^ci1`KZP<88i78I0J;V%bwmBe~IHCi_y*sWv8)SliUr`>P~EMs)^7Tx}-Puz5E5vEet*!);HpCM#%aRX;e5lT<E^^u"
+    "E|p!&_5m^yWf;&Wr*0TJe}Ot<HCp60@po#=Zp^@nXL?VeVfR>pg|lquTAXIT_n|eE^wepI>_VWC$5RT|e@(e)DWJOXpU-tGBlkhAYQQF%s{$"
+    ";V@Fl6+5WUH~HkfzEM^jFEfp>+$$wv(Q50-v?KSr*SfeW9$LCK8OF?Ak+iCFIXODBV(PlJC|}f>W?#<3&R)~hHR_DuR0GdETgH8MX)h<Y1Gh"
+    "drLUsPK9?jx9GjDe9OMZIqJ7Sf)EacU~T}w6T7IaR!q|Mv%jH&d-($Tbmg^;2bH(YsnPR#OVw3mjni9fGQIv3vX4rZq^xa#@|{8p0WQ>yoUH"
+    "`v?pYEj(`OhdCIe%TrI<)Y0-N2wVdMoRB^uf~cao6GaXc9U|s957YA*P9QO#h|oOH}g6_ne}V@C0R|FwOEZBGih0C)#UNAny=r;M}1eG?(0&"
+    "0$S{qg98_8GV76DY%C6<zT3%A~`t9;;E|#2NZJvW=&0c~X(~lZhdwr7Z_05o%m)u;BSV1c<*yX~ihU0Zj?)B^a+zL$gN?RJtTH1;a8=cX?uQ"
+    "AIN(_F9ER;`=Z-B@T{y`9qO83VSd$JMbtEbcB!dr=bgR;?oR%GJ)*-;edhQE^74r0qGEXxh~Vt7&99_BvmX?9GHlTbs$rq|P6erQE9w+VzWk"
+    "fLt%0IK$IIZ#0X6RH-KGov79LS^Hp3&)XYwbe4>^uR?mlZ`R{mvAC}F;<bKK?iWZ*j&*UgYxMFIcRz`5rBcHhAGM))80n+^Og_(8Z)l&wowH"
+    "zduz9x)&kEB)*XGBaK(A}N*s<0|r+&Shire!-=(m+3SDtMSmG&~=y0wm|)-`t?YJ*80+=k7aIb*IyTXw3ARWRL8PF;B*&bo>at^54m5eMOpb"
+    "Dc`DuQlR}zE}!%(1^qxm9=#suWz$q>$JU#$N6PtNSpa3Zf^Q4KfGOrK<>7cI|BCvv2}NBgxB4s?@Xq}p0b%WZ}xF<SgT&6<j#u~ujoP^9$n9"
+    "VXDQyi#;SFQ1#sj{cYIp$iPKuw*HcGr_BElrpRBu64XkGGtX-RVoVMvjlEELH9qWghRo#rrO)y#U?p!)L8dGM5rLtA8E;rly(cv%JXw!1cO}"
+    "X!Ogq?J2c7RovN^vBK!%e>uiX$zUv&Y)V@#cMS;J0Gw0Rf0-d7htKd*f3}oB2GuV{75oFRudU+6pc$>(uS;g83>ag}2_VQfj#C@Lq|N#;6r+"
+    "idMI=7<D%5w&0sqWf@ylu6gU=Tm6P5&8XzvfQ{P8t=jpzy)ftTpmelVfnVv`U>&c{qe@Ra@HK71MIiUUYH>Z?Kc1qce;KXB^H_+glBzEpS8g"
+    "fXV%R-|18Fq2r;y$?OST(U-8_IAi{0{kH|TS1y|>#7hoxGH_D)l}-sK=(0cb0WxHK6E)nvD4h5CBywVb^;Ece8^FYWI7<{0esHnS4N@LD=IL"
+    "FYipkDZ#?yx-f+TE0>^(o9w{`j@lb;X3lRS1FBF{Z(TfXogf5cBksWt&OggTc7Ec0-ga+Rh^W2-VGQhJGOIn4)=3eYE@R%I(*-DWvjDY3+-U"
+    "Es07PNBe!WAKN8o*VA<JOmkDdF=6ZkTZaSRVp7(FfdA~T__718wx!T4^m77M;D4WN#ci)YVPB1!0M!9vnGoz8#XxE~^96I2Ar<b8WWkX4e_x"
+    "V1rQl$prh3AW$7>$RmU@>bR&FBP?#{POgSBq+$sWFXOuq_Fz`TZ<T+EuQ4@fg3&E4|Z3>?Na}V~c*dG)V?M<&X@Po4&;NxSBGnl@3O}6j7Wt"
+    "z|M(1yWg$MB8WDsz5aGqh3~O;IiCHt&L5o3X+6-#j^j=%eqx_(&9nB4mei>9c(v8&%lIan%l+;twjkX?z)p1?^>uT(%r{w7u9ID<)>xIS5>u"
+    "UVjaemB61yTrqPnS7rv1tC5X>yOQrCNWgC7so%DlM0ia}j)r0M*wdR2Yv3ZsKFtCxFgry+6G^IbIiI<M|p*C3xv87E9!tjdCQii<V`O!j1H4"
+    "KATxx$0(hI)tFNJigCPu68|I=4RDR`n~0SrB1rBxE;;K#$E_bek2UX;Gku#aori?Cf|_vV#lqlcdI;&I)s(Ut`W7`BmT4>-iH@e>z8JIt{3n"
+    "0`9xV%HpBhA<Xis9l4}y<s?2B|=n6zH)7~Q5$lS2Qa&dEEsMVUk(x&6t@_tWThlDUZ_VUGI;aXcC+TAXHDO%N)R5SRYCN($ZlXDqPSGAzQUX"
+    "|^6CyXthZC>y9$#zkfwI=Sz3@+o{wm3WbO}5%ehMWSiu(0Ybi*CEMXgk*A(#@BN&JEA?Mgr%>Zmru@T46i`{cLP+O4qIqdRkJko6CmkN}vz2"
+    "Tano7bq!&zvAS(NwH`a18xHpgt6QzDy@@s+2X0_dyjV-WGT$)l<Bu3Fn?_lmuSa6Y_;FCbm%5d3Q(VyIhi&Nl;G&8(p|S2xX6?bY@3#5jCJ6"
+    "_uQL=}V+o0DrW{_jmB>5^`7FK!MoZ2H^v@Y^`-l)4d(oV^0Kd!XOlfaRsRygb{D_g9KUC*zb&P50f*W-&3csyIIC);IYF4bzkG-iaL+C9e2e"
+    "z&u)+ylm1-Ht`RwN^$YbyCre9N!x?ju%D9_X`vqMeg6saD225ey66lZX1s&Z>IgODFm$P>5Fk)t(UHPC((q-wqCuCi$Z6kL7}bhT2iuW#H;?"
+    "n)5oRleB$&P<!iD(^v%+xK4a(126xY8FQ7m9cvjMjWhD5fVLYPcaRds!`5Ev3@;c#O;M?zS_@=jiyM97#e0RUOg<^sK@meSq@V!SrpYX$cp%"
+    ";H++1D=x{`JE<;J>F0evj~7!;<>#C8GEHr{8}3d;kei`y(4j`gZ*wvh3)^KAs=%J5SGr!<Y8k>5*#}<3^{*`LT;<Bc$8<(u0cd`Qck(Ya3Sl"
+    "$0^L-Rvmh$xNtamiHlXAUO<j#y5ZRh=C=X|Btoy>nIGRxeD^nAb9DW9t8n(N;q)K|q7&a}A4G|5y=2em5Q0BF<FK}j0<`+_2lWBXd?}dOYrD"
+    "<huny93eo40#zJ(^9SC!z-Mv%l0e7*eF^n3>iUo!mhz2{W(+tZ;2kLJGG*92dW{L>4M-`~3(yLTKfitjJWJSf7k|5<oR$ttFGOL#^Vz=G$b_"
+    "eRqKe^QBOEaXG{?RY`x)!_`^g`eR!f8Fty!f)Qr{E9$;65stlSP%;B#l-EN2FULm7ySIJLBa~Y2j)Y=qpV>Z_v01MuUVU;?`udQ?c_JjBG~Z"
+    "Ult-Ps=;OG;PoQK#Rw|ADs8St$NndFFmVY5O56TmKd;Al?p%N-EZqkG&c$VH*iw+2k>^Oc&&*1yImIS<M*)NaHoPZ&^)~k(Xuae0U?|@iJ>1"
+    "i{M9jckuWiQEo8#h;Ue$wxx|GQUb|9G4&gl}U9Reeb}&VETx=6hSOA1aE9Oz$4I@j$f;nW6mq)^)aD3ZSUIm39M$#*V_kGw9I1wVhmSJYSKv"
+    ";X09P6~X|D#ObLKK=6Uir@B6RXTj<`@!+-aM}einSouo<+Whl<_wJX%N0#K4F&{$VU;d<ep!e@8<pt2h*8OnI25KfK<)`#ar{@;_HERKo`MV"
+    "~7o}9p6+j%}4DlH8v{PH;G&-r-HA9h1;G<UGmhZKJ4^ymIw9<=_ElIjIy-KoLvTldHFeX5B7go=1PAJ9)Qde&@uT*Uq|6P4Y7zOx%iev$?5$"
+    "bQ2e*}tIYOJSP<$P3^ahMUmwGJlD-X9`|kSUf=nA&$ZY%CUPi+(~|G>(VV8C?|?vnGY0^j{h~FQxgDMZg^g5;1H{+Co+6Gz%$>Up1Ggw7*yJ"
+    "=4pRGH9#?vf%{w-J_Bu~TF{LNo{P}wxn7{G>_4{vycO#G=e(^ZR4%-7X5SQqT08YxI3-t1D7aPxlc=6v|G9EW)M1^1-+tJxb53xOfZw*g)bZ"
+    "L6(ELzWJMj=K#*Z<%mn6HY67{l&;AXT7u<)^2}9N*3{9ViFpBYcl(=ol;Z>#qk{p?d)Dz5VfC5|sPhc0X(Qqsr*1%1?0)`-{W)a1h2%t-C)y"
+    "9)pp}zVM+4DkeDh=Sm;ykgno^gkC`ENvaIjzdK(8NlzOD^6{j}3=75dNp|<c0TAyDdT^KmrMFYc<1dBF$74b-(88k<9<79ZTwW<s`XHRF!92"
+    "uz+ZbjNMEL9-Giy6F_%R;f3V=(M$)&@7f$5fwCp*}F^3Rzs|AYSQB0nP+u(iHDPW*kuw<v>Ok5ptc9m=fOFTkK`zlk!Qbj*kxJIU($Ih%iDv"
+    ">{|j=q#^uR`_>EOJvo*{7(vSkM=)wkIkcS>E9Cd1ML4BD$5_gkCPCYNDUpFg4Lb{imsIYJ_Y?L^Hu(m_f(=g#4l*w2PbR)q2ke552TQ6QKIQ"
+    "V!XI;t^xj{}0foRm*)>GkL(iV7LFa$|7L`Abf&T6WO8*XV*<qqcBhmlA;dGcF3?X0glk_lUh}uTY{^$*l1Ot1Oe!~+({w<r)+%TWN;qf7&_<"
+    "leL$3WBqT7XA-f1#tfzoe&Mr>8ghLH6xtCwVJu+KTkl3Y)iLn5as4h%Hsit8i%*nM=E*b4!#DRSaO`Qx%9f4{nmxqVoJlLIWR^_Jl_=+v!;|"
+    "NIGimA;5F5Q!7uNEL&{>Ezam>(j!sQ=02V>o(~$&f_CsEW^DCa!Q9$-M)^AD0nluxjS1rW`6{gV+a@0agzDdZ<@0-s8I$;@!&*4zf8OL%3p?"
+    "ZRTXtoBKOLEor2H8-`lHF4uH(t^w{)<mmtQcf_ydB3zkkY00DO1`8zO!_{iT};mr-_ndt88&7Pz&wBRfq4YW+?nt<4G_$N&oPpdLB~2s(}n_"
+    "GV+7bZ~uk5`1uq9xgdM<@~whPow6z{Wcg?yUl5r;u7{lV3eJL4!ZBgdy0vS$h&0&1HA+?F8D`vw@?4@eo%Xmo<&dUi79+=0u!GFP>7uO_~{F"
+    "pdpztt28G@vIBL-FPyIo)_f{Ke<w>)T`uA__w@io}UI=*TFJ9mu!3lH$cSO9vKbMo}0{`}oF8D76g)Z2?f0{r3rq88mk6(fT7V@F_8|gZozW"
+    "9|9e>o5+{p8;7Gis`W?*|Am5`Bt4K2@q^ZApw(6*|!gc(8GOH{RM7Imhe-Yh*%tb~DI@&Tw~t)#N!N`;Q1rC1DO_Uf9@|f)(6BRnzP=I|tk|"
+    "4&lr7OBR!S^zjfhf)T&sDa=9YG$87rJO7GTbms~UQF2`9XO{5W<J8HwH=sFrdwT&SZJr_|{QC8ATIIj(zdhzO&_JKlR1jczMjodo^sAfLhxq"
+    "07?;jhvyoIPs;0)b3dC6q(`mqcE_hJPXKh7fP2YH*wJ`!m^pN46o*LDM%!g(i^j{N(Q(UYG4_c83oBMc8OCdOHr7x>xfeSb0WXzRyw7%_DOH"
+    "!-M7oB0V{$P)7vGwz)37;@s@(w+5!RQyc$>w9&}HjUfQBEe3H-A@(2rt@_#Kb^q&8~V<#ufHA|dB&lF(<U(gl}H}XALOMGo{v)<KhgNBu|V@"
+    "sa2-F0@I-UCkscOVVCV@RX_#Pkl1~s4!4SXXPyJgVxdiX*1HFtOvX8i2@PrU@+OOX^ko||7?C)-Jbo0@qW!qui7>O;dhf`+Hx1iS3D2<d*>w"
+    "WeTJWNbU6~w!kK;iLVbbx#M=%3RnILY;J`*C51cGk#>zw>`<gmg|jDgMh##NwfEG;_ygp<a~QClO~)z>A6aERR^2?98(FR3?b+H}s|Pd!tVr"
+    "$%2U2@9Yn1Eo+SbZDToYNCaJf`OyB~-s8I`?&Uo|yVC1VZM{K^vVjIk43IR@zeW6`>ZgK9bTUD2NP#Jfd9RA;3_7>sb8~-7zx-DDpN!Ib5BS"
+    "Z_?FkgZ)G164PX|MTnsj%=mw7fP_1wh6D7;f^<zxCukzjN`-6`UqoBwjIVk)A%nZG>|m*sHTBOLlWYe-r=eyZ}5DT$5CTi#)2k!ZR){GhdP3"
+    "q8^WLz6s|xTJ2V5Tn+*Y50g*3SkiPB>U>vq}AZvX%@jfgq~|#@0qqAyA}cldw{eJWs7uvuxf6WP`po-rJVlBVtMW!Te^HmWpNfI)rpWez`ar"
+    "umGw*h56=Mnn1nwG5G~-JKi~Kp_4VI}&qqi19Yp|boFD!o9W%L-)QqF|%2D-H`AZ@9k3as(8W$l}%qMqj(~W`aZy*xu1rMFIp@mcu5FlP`h("
+    "RLzV1S25k)<~0J@dl?5G62l$Y}Zny{~{XI*)3<c&=QT-)Ca6TRaT&b9M^n=MVEN)bO7lPA-3L4GlLIOQ}YdynKcX;PaQlXQCI32FVatyl5IC"
+    "f6D^|oLJ-2uMPgA^||nmWQWobLvZ=}>948DD^lw799pIMOM2KRS!<lENU6yZkxUMejb7jd!gR=CZ`n%F^V|tencNEJzyp_Uz*RO_$~8#Y+~j"
+    "1W<A<;t{6S*u$$dN~=rM}?QutZKdzy&Ms9W0`Tn=-SJU#h8vpLF-FUR=uYgnEipPC;_Yh+nmOrP)FW*udb9F6kzOLmgEPv<G4l=20y;FPY0r"
+    "BgZUw{!?=JW4e!mQHd*|0oimDtSo>a8T3`bGko=G5%{d^&gRvf;gDJKPDw?ESHJkDU5w*RubSy@HFJ_pOKc&5EsB@`Z)WN1ldJ8<j+5zkqnj"
+    "p$DbK9K7u)C&=b!dyh5dZW)bt;WCjFO9+J-IpW6jde2>8`|B0gdgF1lk9|~pn3RvXl2brTLijtouB0q{GPA8RcTL0&Q`6R;QW~xN#Boqzzow"
+    "E0uh)r_qA8pjn_9-9Y!#q7201!iNf(P~fm1%$rj5@$X&{X3SgC6TE&&;yy5cDlyPQg;e2igB$ZP)(W#*w6d=U>5da2t+IE0P>}ZN)M+i#R~A"
+    "L3WYk4hIMXO_5`X63L<Yu;lakf4};ws=KQnLs3pP*iERJo_<zW*W;^d;?x%x;ks$bFmo0!);i{L+^9~Xvx9=L6G@yEVq6TYCE1<+pWQ`#EBu"
+    "s6zPF|!@E3Uz-zOYGM@;h9>DIVr0_Bcft6f%hQ}jf39A9329koY?0Xh<|K9@ciO=$7L3)<WME?;nz7M|4CMeNJm_jM3P1dR6ptUk#WK=;$ul"
+    "jDMEfM_8;HvY_=6dI)YmG&ITy=Hq=rdY||ORACUq?s@9DQ<o3Tjz0`E<V(2Kob0M;?5B^A`@S{kLRJ>c`xR2j-OQnVSr$C!EeO?65&z4Zas2"
+    "_6&M2ALA6fBk52eQaAKzISKUQC6;k^-UJfv3oe=A}f|Wz;LBpSZ`Qgp~1VgMhZhlh20Q;2LKgFfhy3+C+i%-8k_ai&zr$=m))K9gH{gTRm?)"
+    "?7iPyhP)O=v!9PQO2jo0h7MO;yLAJAeP@_rLxy{Q1o<QVEMfU6RNjVYKw~TNIy?EI_|cKL0tk?aR@;?tYlox6Z`#-}Jl1ywj&;eAlE#o;f%V"
+    "&_j6Xh$gkqi1|`sM(ZkEX|Esg`$vOBYF#M6!PJpdeAUcqzWf^(+D|92%y`eKRE-itwi#sAUo`Z1_t#t``_Rd(zW2#t&xMxFCYl)fJDV493^y"
+    "wm=5lpg?+~<-b-j)&A8%KydZA^LM&=)fY4K3=5Jj?2HVy0J(Kq@muYS51Zknhl9x+`H!6(x4qr0p;J!&mKt1nr3VxdvW^P{1vjM)d+eJo&@F"
+    "XUN1|J%(5XNT#FJjzR6#HCmkel$2gN((AG^~9lnr_?cnDV|pTIz5Sn@Xc|odkp6V4q!9H^Xrr>R`q(>EGF<6#C3-@A&7+SL{&hAORDjr)4o+"
+    "eBTDzk5+1X&a30y&Q4`1_XA=T}v(>XPHB^be6S-dNN;=>qM@)rkScNXAu2t+#kioskH1RVLs;B9g!1i@^7I6nG*yQ|pP|`__eMPnd9c0R4uM"
+    "5Ur$0{(@Pm;M0HQi1Z3%JX*B8XxnKusp=$WjA+5v=JJzC0G@wzS+IS!Kjf==qW~uebR8ZFkNp;erPvdLLETeT!P(+FBRQMKk&M_1gJ`F5pOl"
+    "iwRaBv0<>|XiJnyoBwtigwydTm`{0umEtkfxx<S@5SdPknOYYy79pfVX9)#8>GoJ=hNZ_Z++6KF7~R1o>624Zx2h_aNFa*9KEQRu&A7~LaAM"
+    "Lk_WaRCp?|H*%+j=FOHW1Amtlpvh`BBsQu&Gaw6e=pv$gg(RR`398nsM=%=${}FSGGF`{cR`3_w~@G4maLbOCs!5eXcp#v`7;gi%-UNuEdGq"
+    "fbtMK6RoJZIaO(z6l6WpRqvtf@Mf<ffvbs$?{hG;h!TNjV_5^oMiO<<^G<pX30eNDe+~k7@a6~{DWWlKfQ$MKq;DXF=w*st*4iZ5lvU!@5VN"
+    "w%6Z_~&PqFX#JjblRv#Y1Mbq5e)b*0;3?xL|Q_{g&$Kp6k;;QQTv7F}SPdrx1{LDKBdsUHng|gCzzft!$)A79CTs4!hN!&P{?vn43&2~u)E>"
+    "TWcXvh>AjK$bzjFH4}-^~g%EK>m~*skOB((fVPF_dv9NEOeTSv%pD;Q@3b9Ocu?!aUCE(Mm;JSNzDioZJKWpv36K9k6>iAsP^imh!a1e+j`9"
+    "M0c$*%n68T2-tzn3ken5nI)2q)fNT1>SP`%TatRb7F|>W+;_PmfPcImkf;Fo=a%KSPpI&wI%N?p@h(f<!jPymF^W&0tK8Yl9ZZE5qeQ18QAx"
+    "!MDNoUraBSe9Zjo24s3LwWoRVe`AEN&E>;Sl|aMIRM@Ul|r(Prb;@X;LRE|5@_S|;|Q+;|t{+w%`l^t>+kR$?yLwrNs}IZsYpV|_QSmz(Yz{"
+    "tq#NxXVl8>w)k?zf(qQtB#l@_~h^Z^~)RRB=qs4LCH(eDbTUqiv>wF_XPw_C@7HVZ~?i%5Kq+ND@$3;eGY)k*ftc~X-+RAHe?c&fk<IgoURL"
+    "&%cAL*jem}<$|*G3<RrPvClt?vKY`>=-Xt<sxSiqPWQAtDQOI}0gRipMf|mxmj0o>+?|pR^U|iW(JRFC?U~Cv^gs7`$tdb)0bCoi~>XJGf1T"
+    "&uLhRo=qYmHiY%f3|<ADr95@`z``t@B}3Xe&mtwp46wTf3`dUd}Vm))wYm!r5Y8b-J6NtoV@vM0b)^b}F&;x!;B2?hQQX8S%8LpFFZ^ykQ%?"
+    "f7Bn}tX9pc-~EZy>O1}Y`^RO?KdU|a7L)ry<Wu({LY!!R$g*Y+{jLV$Q?Z23F6yHbqm*FUn@Cn`!Spl-f(oj3iD0hxVYdj2kX5%}BAV4k03a"
+    "w4$wK0~ISUrplIQjv&3W-7F}=2ZvX8IVVT}v6{#`bH-^%geK39QgBvpGapTyM|K(wFgz?0;}QO;zw>L?6F0P~Clylu8KfCNd$7EdojJe5^yh"
+    "kZ4}KK}Or_e#R{V;4)t%=qU6StsyMME@i~#kV`0s$9jlJEZX=itL)hvao4xVY<D&Vr(Rhow)|K)H)Up;XyPZER6z+z^SWZTtxtelmdl#ToCP"
+    "m?@{uX$`WcW&saK5p5_@dzE{r~sFpZlCCnkh#xkpRy=LGzdZp{Dpq7)}<JXujJ5q;|E9!Xnu#Q0ZN~gnMv=J30Q%092Zr~ol!3aRC&$LKEvN"
+    "8~A&(!6_giMdbeiu7u@%-7K-8U<Je0+AFjNu{|JjRF^xS5V-z2W(IH=S+j)q2;A?3w}jIzT4;ncOD!Js$2cU275l1y5d(%f3(sY&|~qI1S8b"
+    "y%X8H&d#Ne19;8Qy*-W#Z+HUdPWBdudOC@$Cy1WDgYT5|ALiI+%>B!JfSW9x5f2?&Um9!eaO(m5utt(eafh6IA6c3}M3XuKA=BS2o<s0?cG7"
+    "I7^P1GX)w?0fo%PC?kTQ{OHl^WUdS}f@Trr{*qmm)N6xA5l=VUY`AE(iSo{MfL5_1K^?%}};!SXYbk3K6*vagQH?WpeX;F+sr59vGff+MsJ4"
+    "-Yw<;MsFm2P16h@$<MxlX^6nsnu7f_K8*&mBVhQGH~*W<u(^n#U#eYuyh8&2AN;59k!s7DRD%$;j|L9Min^;QUbIylB;Gq_I7RktkBW&%qCw"
+    "e)9neHb<@|^IV*|=!5caK-&#METK6?Kl;_9TAGB_J0%!}NBFDtV*bU`|OMHpMd)u)8+p#9t+TG8ES!iXGsENzSkGw=?s)0KRO|&klV~-9L!`"
+    "6QJRp@~5={?pucP^kC)<FPEo4};;OCDFwy2=i1_XoS@Dq~@bxw`r$ATGGys=T&slrUy?TeQ{dK|=a-?^>O=ByyZ&bGfT+eiset0S$NB7r{|("
+    "?57DqApig%iAW*>;Yn_F<Ng?bHy}qsnb}OqP?WN>w`DEP2vHFb)k#%%ta77k@#l9669~k0x09~Y{c<NK3i!P#my`INx7>4qLN)UGLOs!UZs0"
+    "VUg3%}7@$Mp3-ZYWcXkWF}ZR)k7PHBYEYete#-fqIUI1)1=i|c;(E>f1GkWUG6<&e2C;%b~>=~`XfbM|&`Xj-WEmrYr~zOGWp>Kz@wZW7q}o"
+    "&wchwE@*#Buw9Dc!*H+9ysrOH43Z%RWnK0*^cq{$N6We3%ucTqRHcRN<D=Fh%fs3Z`)s*{V~n1sm#LVWlJhR5iqyo7^#^KB<ZD8JVvZi+^Rb"
+    "^rE$YCY8;m%;|LehU`MqxZp55Jo)uTfYMLtv%zW;*fc3eHAKYotFP^9UT#1Z!!h!p>FAr~i==*lV7gWam9!1^#3JWlXkw=4P1dUJB%Qt3vx9"
+    "=3Dn>7)B&4|*dq!R`a7eM6<IC^<CqCtx9g8#AzB~+$D=#ljwo~yIaSWCUl$daHd7TV*;YA@D$Q_~X}bi72|wJ5QJnO&66><`>u#PUcx-^deA"
+    "l_1qU?W#2-e+TR~{|Jk7IhqF?jjYWr%w)@EBe<Gqm2@d#r(13}oaDlyX9R$vhO*5F;ZI!{e!Fj}y0;R<VXrKGOHI8^M~GNz^<_B9k$wTn^Hl"
+    "oe!<yh>C>DMy@a*7lR~z)O{tyk8=;@9$zv&$i_Vdxl3)l*y#1ArZNw2o5k;{p#a?FG|Scnq_D5-9ja$GiQs1)J<JIlM#lmi%H&g#{M)_L}kL"
+    "&2p7{Gw-OO06T^<!HJJW<M?LGqbtwo5XDMQ<@2Q0nSfP@&Mn6-x2?vkJdLP5WM^975ng{-ZUr{-BSi6#;d-d5P5)A9%I|bh=2x)!`HO((~_H"
+    "t`}6vBciR0+_o(cWLN8#KTCR$(xqI$hzRrDNWue+u3^Ge9=foooC)7HspFZEy4y3{y_bC6wgRP|95=k?sp-oWj*B+-+P(EZ%BEatoP^UtO1<"
+    "tv<zSL7WX+RLRu~<Bru#fio)Wx~zmszV-B2%Q@h<*F$gH6YBuHK>RLGoGR(DIPZOqzh@bT%u@#w!%wH6=cH-X6rIBe-+#qAJIgkC8mmL0vqk"
+    "(ZCt|Ntj6)a_0;LMQ{(|c#OO4u>fY8SzYq8(;D`y%|R{KDu-5mD={9J*!IdSrRW>PCBt$`0AgaXh1w?iSFXbFpAMS+Iu$gvI&aeBW47n8afg"
+    ")yovLVoI)HVD(srt>mz_&%+FvusmwIxMxLDIdHgs&cfWzr3WQGwDyJPhdFAH+qSW)mVo-Gb@&KWT2|C8x><8t{#EIFRh)1rmR;bk4QLv2CiY"
+    "%E{rfu+88Eex{E9D`si_-xi!cs!m=a@Rqhy*z#cw;&w27Vc}8^B^uE=&+PrIcI{;krXj3o?A~2Dpy|{k=&VozQFb}HvFW_1i1vK#fk!uA!^("
+    "!Wblw9q0qHgR+OB$nJ5(6gQt#5P1iR=+QReccJ9n~DT7Kkk=8*QNi0a|HWF<o2*Vdn5H`_(jv|fsFSBYd#dVVa&12t;1)9f>Du$VRt5IUpg^"
+    "dE6%I^Y*i3cah-ze>}v+p91A6vJR9w&lEUMbP!v!b@-x2bAO&kjy1+g7@pN>v{pJPV%yvn9b3*bTa1k$l&jb{mLyCQ$@jxlD|ajWQT=JltOm"
+    "P-W8-_t=xPluzh6WmjJHJv-ZN(AiC>$u6sQa(<>)ALDvgRbS8@GiCJ$qwK9W`%HXT-*@lqfgr8*?-RcQ%_M=fg{>rzMb}&7tK}DH|CQ#0)nr"
+    "*I6v1K)OaiPvC$nUgnz055W~lF$vxZb@&bl;OL%(6zA1AGG+0n3*@!wc40MUe8sGLwIHeeDHr_LfNYT}Zq7dCT*N*PIBlz8S$r8Iq|wst}dP"
+    "<NH}J^%xjiV8rQ7IqQ4$$#zkCLHW8b4D3u;i=O~2Of>OT3o6e)gv*K8sy4c<wqI*0Az{BJAh4vJ%vZ4lv#!LpR~xlxTMS9UP)d$iHBy<hw&y"
+    ";NdZe@(wtPa@95!lR%>zu)=}4Uh%w0I3yqlQ#v*#yFvCgeV5nGgBo5>)NLiBcYvGcpU5z+aW(*P&(abga^}1UFes<9PaWpZ<&sSZs#d4;(k>"
+    "qsKj*Ul~@fB&}2SHKBqLxlkT3*X)G&{->%$NS)wP}ZS5u$`~CXdgYD){zLz?d@Ssa;p(q{z4%t%^;8=A}~~YQz>F+KHSCDcX4V7<2srbB|58"
+    "%{cq-GO{|O_-+fUSXUG8Nzsmz8E(YdqVbVjWhw@FacqVEYo3QiGhD4yJZI%X({R|XGh}-YxjpcrB;7$tj_w(Ye`jwAn)>oUsaXc7=8ep{u_F"
+    "GqS{0m)VUExj>St%C7_Qr?e)_U64OOvJ{&1OjaT&?Vt~2U&h1Me@V?uuU@@3JkYEF4#Q^bw%DY(+Q%Qh2DhJQ+Yg$|=y5PToxlwD4VsWGz=w"
+    "$_Ni?g9$bDCq0I#ym+UJNGW-CYK*XTxiiO)lRc%QA;xWiKmX$$`S^+ptG&qh;4<ffIRp1x&&+;nTfN4DWk=V0h2<?cRpu!jrxOZIL?(;u;%t"
+    "ssj%vs{$vbV$r}WwmSTRw`JB;G<bsP+p$0x9ml!OYW|ra9L|#ttd#!ep7`=9z0ox)&O2^_{G}%uu*>wLeJm7$RgCJ^_!H)rN>{1h)b4o3Xqh"
+    "2l8d&n7%HmhmvV@888B36mO?d0U=<c;_aq6*)V!G?aW;#KzrEL`+3$!o!HOXz><2FpCRtyp%wwE=^X!kV!?w;yaq;KskN5*ujQf?;cy+bg0b"
+    "Xd+u%_;EB_XJ*}z1fxKf(xe9XV^6a%&!^{^=o(U0Una13Uh5&vze6+%`p)Td8L+YlsbsZA6F~$DIzRQ5C#Q;}ne^@jV(30)#8^_Ai%EM-I(e"
+    "1e2lEuJkHzKYsy8MXndprJql9MLF_4>L{L2l1MrYcg^HW3PngScbtz<G>)sEZ;66nHXV4?avU)1$>^+6PD{&Wx8iM!I)g~!~5(_IZ}YDQPMl"
+    "Qr@L**Xd{j@cH7weBCSbC69c)lwiruIG&3ra%*ZSH_4aWpc_(Mj-cv(q)UvE>LI$?*z{HWS<N=ZFHraXdm)1e6M)bkFG<frT0j9%#7Q6q~!T"
+    "9@kwblHc9Q2j#0d_CjpLzwMEo1Z1L>*;o+gRzZ2i?$NNqmg~5cVxtb^D1eYPua1su0P6T@xWTnP8-I#XdFgiJAwR2ov6?Sa%ZCCWY@p<2<O8"
+    ")CVq8p-;MlYO6@3)=B<m8z(+{5h1$?&mZ4oL*RI)WpE#@&uq3a1pk!q(sg$&BVbU*a#_zgEGt!X2Y6_1Z6K0kujx^G)=0yH1kw`A+LjOZX07"
+    "3qX{E>0t`W8(A!ex)>;s+q+T4&^T%jtFjMMs2k}-&$y}Rn4?At$DBXXlt_4V(PqYza&zVR+3jYPCBwnpUZ<YdAk26K6U2=bAGg-UWBZRYs*u"
+    "ATzI2%FLuF}jEO6+P>@8~L9Brej{oO_W?y4XqP%CL*&vud1Ti6uz8k+)4rf@E_&2Y&vKhEaOKcPm-(?&1c0LF2*Z;%4{5Z8twndUm%E#uaDZ"
+    "w_%xGHc3@T7LIi_U_%5J#WI0pP=5jGt?IxkMuPvzC!3K|KPZ8JpIi*{f(cNT<61gGu(m1pphOoNGg^vG1S6*xCi9ek3Yj)`~43;fEURhfB)("
+    "C-$Y>f*U#Vo^b4tEF|1v4(B(`;&oa&nkssuRv5j<S7iMH59oR)ap=jByU~z!xz!wa!YQs^g28nh_AGu=J4+eTQ@neMhREX8{M0sAdBQI?vQg"
+    "ohY(D;Wr(Wip9@J47k`*6IR6oNr~7{k*vcmdIC5*zV~10ar0PFpeh@3+(O%`k%an?qTm<-R>ktJKuIFVh$L{OI|i$@bmMhALsP+<h#9w_KpZ"
+    "N!EjjUwmIk+gVjn4Qrq2$|%*|)aBbK`9%iSRx?7%?8PNAK5*tG5&*77Gf501<M@uRy5zf7#7LuFHvWS1aM$ZF)m&lFf4!6!$#)^j1Zm^pK}-"
+    "TCu0*s8<-~fNFDoZRkS4*1kB%R>u%WKWouW1T1$x)92piVpv)KsiC1)g=+(jUo#7sHJtf%EK#FA>HFZQW~r7oaEcCN2a8KE=OF(U0d(Ul^Ok"
+    "fwriUONbqyrxkK;V6k#3kVD5NYtI)R_6S1oWgXyDW7jq(;xbYy(4&=!4TSO*|b?pG;3A)%L1;~e%9Jz_zwG6+6H#FjOsSNPGsqp+|z7XH+N?"
+    "Qe`a)h!Ad;cx{7^FkgG(fLY@uv08<(mM7(Uc5}+X~_RMXWUG-Yw%c(>D@ZiOZ(5tQ6_G)Xq7p?S%K}jtjyE1@i2jb4mgOEiTk}QLknTwqXoU"
+    "gNJt^K^)-wqXTYp`o;zH=eqa($K~S#o&P7X6S-Aex0-DcIGT5`Z-6p^)tjYM^V>;uqj4JgKpZ9rBLnuAGqdNjEv`<1+HR$mWBO*X1e{k(6(9"
+    "IrY9x^)n!WAxH^s&+WRiKUtPQCeQXqrC@Q{Ko#(({P&CK@1uj`!5@N}&@c+ovACFtreq&29JbYP^x)haI&-Uq&w?2ccZYkec=J!-UV{RXlla"
+    "B^Es@zI!A^VpH0^=m2X{V^en$V^t_?rSN8<3)ZP4jB_amLrEy`7cSfJa!^UZG8JW4&1`8Ur{>11<O5!6B3=awWBlw~QNpS_}I!f7!iy-$FPv"
+    "@6IF@OoNILbL-7t?I@WTXlOc{5gW!hC9zQg;3Yd6#^e=EnKwKyX;b7dni36lEt84`riwT&6OAMjSmB4|7oCX?#}1D?mr5!ZW*RI)_U3oeZlO"
+    "vYCX$Jq_T2`_+GptH9YBYJKowIWSs}n*Iu;s73(H7?)w{cmn0BR=d|mmV-I%GYw)0LF#@DPSctHWNq4p#-+b&&ntHwXdK0CUl|*=>1*g%M8;"
+    ";|bjG%Gw0G3N!f2kyfjE^7lfA|39h@sScl^)Lg5yHQoL)ob%T~rGeZ(lH7KoYDjnZl&QM=t^xM{X`Uu|hzkISW2Y^Pbp@H2j7hzp~J+C)(6K"
+    "C-hDfma`{>17}C@=D#iKGQy@vOz6abbTo~}7b1RQVA5y?;Mhmju1%B^P#6vifm^W|M}`ZpAj06GrZr+iA@q0Lj(jPheY<h(CE&WrG*bW~`MB"
+    "7Lq#yBr9S@4y%`Pm{yJQ+4RYh<nGbq<iC&5Y;Gi4!)1iO+K;+rT05o9fQ%RMh&dB*kPdSt0Z_N(B1j`bcoPn?M@p%^8Cyw)s&F_&I#7tMA<Q"
+    "YbuOj0ffT%id%)x<!}-<TDa?M~G0Qon4P`iJ|7j{dz5z2fG^zO%pCEjs;yJgb^_fj9u@$o^JHQ6+={gNX84f8j*@^u1E$V!FytW=u+8g5xce"
+    "fsefrNU`67ua@nPwFVdH1pJezexVAen?jab>zJ1aC#;<X!rd+>I5<%S;1JcG%4A5w2JWo>wpX>ybB${lyMcVkNcsi<wBRwLZi0rY4;WqB~Ot"
+    "*@k{;c!sFDCXD5Cf-b7|r%g;yAjzT-8n=J)i6jg^=UyT0<ZtFv4b+*_DAm0|tba3oZi9isy@*Kc&<3Ss{1RuC!Kheke(07*b1dqN{#4V7fI?"
+    "R3Sr@t0cb2P^5xmmlmq*sQ|j5w}O#rU7x|hST5&GekrO14|7aOVr*m_BuBDXYfSfp&pT&LaQ^9GxSv*9QRF&)$8y_yKr}BbcyJN6WWq#@u(c"
+    "VwYt@E)p_ad+{I9qo9hZ!A&Zp<k^)I;}{6$rrLrGZlyU#d=e^B&ol-wG|phQ1|-EX;SiIxw?T_nJbM|ztIJLuF$5P|&N-5|YttTF|IOuB7T("
+    "@7q!#L-x;N8HqV2uwV|#eiiD7*W9o&rETe_7<gmSA;-kztS4zL~Ssw^<0xLj#J$U&WlRSbuEDk!Dbd6fTHU?*ib1NoC|bx6}`SEdqT^UJ7RX"
+    "rZz|98_{kz1(>_C<e4UV&r=2gK|E%QkK~PC}1tj-bG`A8eTpOiUXjYVD*L}Y_FFW~yIIAfq_<zrrjY^%b!;Hp)W2Dq_!qZQmD{aFVqdWf(@M"
+    "p59"
 )
-EQR_DATA = (
-    "180149143150133121124118118134164203260178188156177147133118131123133157213263193190186182171147"
-    "136125118131179215251188201223196182163158148122141173213267179181212218195182170151142146171214"
-    "251154171201212219196178165150150161202260165156180191197215194175158153183207259162168161187189"
-    "199204198172159199218244158162172170188192195208200171196217267170175175184177193204213208275208"
-    "249283197212207218216217226238226240460278306239256248264251254250261257270311620360295309304305"
-    "291290300294298322365404801246181184192178156161172204213223238271224260201203197172150179198213"
-    "230247281218230254219199185181189199215224245286227242251258215213188193208230241250280211228238"
-    "252269199198210210217229254270199211233244242262217218220223228254258196199219234245233276218228"
-    "232236242260223224217229237247262358264266261278282236244244238258277269284436299298301315253267"
-    "254255252268271303322514309324334256276262269264281277300329349598342358274274288290285291290315"
-    "346353364704437298304314322311298307319349372402467806350230230238227212236231231248250259291281"
-    "346257255239227231232237253251265278269294358270261255231245240256265267285279300310349271254262"
-    "252252255270277294270286281310358281273274260261252282282256269292306313365279279280270248270280"
-    "254269276299300316415286282290274289287281266279279302315334444309309302300304271285288283302302"
-    "330348501316316321326294285294292293306323338359560328326360289290292302302288312339355343634335"
-    "429313303311304315321315346356353357706499327324333330320327335345365401446532834403268266271262"
-    "253259244267258260268304291398274279274252246263267265284293313306319407309289280269267259278282"
-    "294307310329342400289290280274273283290281319295316312333415298294292285276287287304289287313330"
-    "324408298308284277280298307288280305316330342456301308301296297317286301302309335328338500317321"
-    "311317334293310300308319332342348536326326325374298310305328320317336347368587321334449309307319"
-    "335324314335333357370642366506319331325317320338333345353373411719579329340348354342347366371405"
-    "468538593846404275280279269258273269276274278293362320411295307276286261262279275284309378326324"
-    "429317291303280280280278298310364327329348437307311291290276289290309377300309327340445324311292"
-    "299294300309356302314321333354464327303301301285308363313308328346357354493322317322311308372296"
-    "316308331341350379514325319318330404304320315324333334358360570331343347448314319323325328335347"
-    "358372619336382500322323335326328337346362383390670432541334339341358358351354364391403459738597"
-    "397400402413400401419428473520578614843431274282292284270274287278286300320389326430299306293291"
-    "276276287287290318394327338441327311309293281292294296336389328341360462338324304300286301313335"
-    "407317345342357481338326316311301317342397311321349349366499344315317314303347395326310329343369"
-    "374532336323315324349432321326324327357367383542345324338349444323318318318335352362385594349359"
-    "394507326315341334346350358357385638385423536338345340349354342362378395420687456579346366361372"
-    "380360365394418461490752618421438426436430440444487529565594633857453301295303300294293304299304"
-    "296340409331455313308308298292301302316317349417338346476337311307304293297315316353422340356365"
-    "482330313302307300296316341431314338357368500343340322313300325351427338331352366367528345345329"
-    "327320354453333322335348363377543341341349331364482317333356350359363378582357344345400501321334"
-    "339342354364378391626366383418546345341339348344377377394401655401452574338346348363354362372383"
-    "419451697481598380365378373382383398420444478504750642453440446466462477498521559596624650854454"
-    "293301315306285295304312308320353443333463313314308309303300306318324348443338348482330322320310"
-    "293305312330354454349354367499344334328315316323335373462326359367378529346341332336324342369468"
-    "328333354370388557365347341340341379478334332340359380395572348349356358393502340333338346366382"
-    "400598360375373412520348343349344371375385401643404403456566345350346358357365385401421673432481"
-    "583377369362374380379390422441463708510619375384392396410414426451476508530752649468473476498486"
-    "501518557597611621669856466297303314295298301296302318343384471339495318326323310301310318326350"
-    "381473343357494350335318321304314331345377472356362385508344344335324318333357396487341343374367"
-    "539359338330332340362404482325345358377378578357344350348367413499331349365379382408592362363375"
-    "390425528330336344353390374391626376381409458554336354359367376380402418646419433496593355354376"
-    "376366396390408446699459514609369375385384398396423447466487732524610393424425431420451456495515"
-    "543546773656501486504507515539557580597621644663847474306297323310299303311314336349417495350511"
-    "325333318309305311317330368423499340360522351346331320307338350367429515351366383532358352351330"
-    "328355385432505343371376387551359354360346346380440514338359372383381575377357356372395469537342"
-    "335360367389401607367376395431483540351347353364384396402645395409441495574357367353371374386405"
-    "429672441469537594379370378400380414418446460705476538610394393402408423428462471498502735564631"
-    "433450442467468483496538557582575802661512522525541552565570588607625650662854485310316320308304"
-    "304309331358395445505347508341348330320310332336365402450525357360529356341347320335353372406463"
-    "523345378385541359349338348347372421479545343360389394577372354355374380425483534347348369386409"
-    "591373376377412441497546354349369386385408620398422418465502568346364361372397415430659415445480"
-    "524578372385383375402412446462690466522541605381401400405425436449480499724526562626426436434449"
-    "457471497516530549761590633472488485506504526536576580590614801650534551552544565573577607617638"
-    "652672850489307315333318308320326372389420476516349530336352323337324344375402434475526350375538"
-    "360349343341352387403454484531364380396562380367353360388431457500543339376368398581368375379404"
-    "430463513548346354367396421620390410414445477516559367371373396409444650434446481496530580376382"
-    "373410419444467675471485514561599398409413406436444460481715511546573615418435439454452469493515"
-    "529740558584629452463469483495500517537569582783596625503519518532526550550588596611616824656548"
-    "550560567573599594617635652670674843501327332347331355366378414456479512552356529342362368363384"
-    "386426452484519552373384570372381392393418435460494526565385400409596400414402434433470485527578"
-    "377398410431625430428457455479506548582379397417440456664447474476494522550580394403436433463479"
-    "694497496508530553596434434430458469481506727508527551582605451462465474481511523555755561578591"
-    "619473493499507513519552554571768578607646484511521534533538552566583590799618639534531547564581"
-    "577581596617620630830664572581591599602606617618650645657680848"
-)
-# --- end tables ---
-
-# Equilibrium first-in shove chart (from Logan's solver): shove probability x255 for
-# [players behind 1..21][stack in big blinds on PUSH_GRID][hand class].
-PUSH_GRID = [1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 5.5, 6.0, 6.5, 7.0, 7.5, 8.0, 8.5, 9.0, 9.5, 10.0, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 22, 24, 26, 28, 30]
-PUSH_DATA = (
-    "eNrtnQuYVMWVgOv29MzwEiWwgqg8fAUNvhYCJorKhl0jaBRBNPhMRNgYxSfuxjUyRMknghqDyComKhGjGA2IZMn6JCriCw0G"
-    "fKyyURNFFHBQXjPTfTPd93Z3ne6q6nqcqnuvdvnxfXPm1b/n1r1T9fe55zY11cZXdPgkGH5uEL/0cfuHPgj88MMgKA76Y6uD"
-    "AUpoUFICpal9NjWxDkpoUJIs0I0+/RXfB9RxAvUZoKRiWgqo7YASGpSwQM8tAyVxA80F23zq2BdAL3Y6D+RAS99aBPWK5xwX"
-    "dLt7UFIJekQYOM8oUczooOqgBHPCskFJ9YwSCEpiAEqYoOvKQHcRgxJ3oEvFGSVi0IzrjBJN0F3dgZJKUEKDniJ96Ild0IUi"
-    "0IcBtV1QYpLRQpANfuvaSlDTM4sDSmhQUgbaygctTITXK0GJLdCn2aDEJ6Q6KBGDalxh+aBEAnQ9AiixCwqpxaC94wHaXJoI"
-    "BYKNBG4NK0Hp4D3XGS2BEgi6jgE6yVJGiQkoK6PEPWguamKDelKgFOkmY9CbxaCEDeozXIYQlNjOKARthoeeKIASGdBPsEAv"
-    "NQBNS4ASaVDCByX0mSUJyrnCyoGC6AwuKKkOOqIQdOKDNpaC9hPwXm3Q001AS79KCvRjdkJr4vUrb5yhKaH9KKFPXFJxORct"
-    "i1BVCX/PRHsTQmODswNcQFl7FbWLkM6eiQ1KaFBCn+F/Kbvu5z8ewjvRrSxK5EAJtT2hLln+J9VACerqSQTqV4KWAv9wWl44"
-    "BAUXfAaoXw5KzneaUcHf+lFi0MGkGihxBOpXySgdlF7z+5ZAv9BaPQlA2YGTjPIXJSy2LBUMVFs4a5xMBqCEHdgEnRYr0F4m"
-    "GSXyoMQUdIorUGII+mM+KKl61iODnqQ5RwWg71gB5e+ZtEF1Dv0cog9KdEF1Dv3v2Jd9Q1CiDEqaqoDuwAIl5aALClGjFCix"
-    "OEfFoOxdvhToS6KVqiNQIgNKbIOuxwL93DKoIL+b+Nj7t0ezIOgqFmirE1BfHHUEoB2mi3ZT7f8OswfaRQy6JwAddkUlqFdE"
-    "60mvpDFAVfL7TJmBEe5PL/DL/0pYA63AvoAQljci7ItqZ5ug4vx+WAw+44KC4KKIQEvhq3KgxBHo37mgpDzw2dSbasbZyph2"
-    "zTXTrpmWgCGozaNnTLnI9eFm2JfQz3jGGcuP7lHmRx2K3Mo9kwi0bHvic6iJJUnGBiU0KGGIXOJDnepXs7pWQfdlgLJsHnHv"
-    "ngh/FwpBz1AFbV+TRwLql5179pUOFuggbFNiC/TWVUzQega1ZaXzjhj0jlOYoPQ6ZIwbpVMFdB6pCkoiVzq58oH73YESbdBc"
-    "cdzi0lU3OtCBEkpH4lrlkzi4px5sUDqjlyKCdqkOupYNOpPtnqZQNA+Q6ExJ8KlcPVFfNuhfKZrH1zkBrY5Ngx7BmAc72oIg"
-    "FSdQoSk5Okql41UHXVAMJkcI2petdHhv49lUOi1C7P+QcE+NrBWKa6WzuBiMkFM66YhA55dNi9i4J7+Ke/KruidHoOXYzyhL"
-    "slcrOV2APq8MShig01xPhAPZoEW27RXUrNHdPuhxxSDNAt3uczIKx+6u81sB2igHKj9/R4HoBnPQwvVhUxG0Zoixx6zLc2NW"
-    "YZQ+itvQLB324Y6ILh3m3r1m7ebAL73ILfucqnaMBegy3z+WvUZyY/Mg4a2VoNQEP0q4mDOtgNBw+DxQQqqCkhPwJJm0Hx2r"
-    "A2pdQMiIXEI+DYPzowMlUqD0xvODCEHP5YN+tz3aG4BeFYOMDpDJKIkBKFECTdM0Yb+IeXFyT1tYGR0RBtkYSjLCeb8xOvfE"
-    "AT2OCfpC/ED3o2mmUJLMFSgL2wuCOySUzsToJFlfCZvHmrCfuAYdkhRJNlpTkk137Z5u5ZxoF3NBf8cQEK32QccoS7KPGKAL"
-    "nUscNuhQmm17VaUTHWhRN2VJrtq1Gmhv+6D9qTctGaCd5STZ+MhtXj6jmDYPHTQTsvXUAG0TvPwtIPozzqpApMZ1M9oBRI8j"
-    "5Pc+/UO/GkQZojcUFjPtYVv+UyPVQG8UvKCFmU4pgA9rxtnGWH50biwvjNJHcRvKxpnwjDPV75dUNc7EtXHGF7nRghLYxlC8"
-    "qPdd+VEB6Lty2vEAC370rUrCNB90bDnoRLfuqRBtCRcUXNC7clHf6ETuEr4fJXxJRmJl88bFCjTNB/0FHzQnbsg80Tw4zNYc"
-    "ZYCeV8U9zRBOWM+de7pZRzuWggy5xRHoNj5oswRotDYv/EwPJUnm3D0RVUk2ISmgLwXB/8ce9MogWBInUAlZ6k47DuNg9+SC"
-    "vswAXRYTSTajWkZjZ/NKb5iIQPs4n7EVoMOkTMmE6G3ePsjuaYct0KORbd4BILreHLRg83pogIreiDgnKdqxI8KM/T4W6MsR"
-    "aMdNfgV19bHIvXb0Ar771EBPi8yPPqgGCsd/E4whxC5m9P2sAehsF6CHBnzZlYkyzlMTwtncNTeag9E1/188hx3jTJJunH/o"
-    "+1PZK+K7i8GRaF3e1EBJuXGWELm+bT+qDtolGpEbjLr4+lEYHcVYavjs09LP9UcMxh8rQedaBt3GXxPtWwE6Wjhhn/KzMZBk"
-    "MqZkaKk0Ex90DiLo0aQtQpunABqVdhyoIckiqc0jGqB9HEky1nskLFDCAw0vUkOdgo7S144XudaOFRvNMFiudKetA9CeHOXQ"
-    "lQv6bQbo1Oi04waudryrqoA4zyXoqUxQD1npfIKEXQF6OzLoUlugOu4JascsiPYRuD0j7agDKtKOw0G0Riu/TrSjB6IHECaC"
-    "F7C9qwH6ikCG29KOc3W040rBHLUFukgH9EH32jEV8J2tBvqdyPzoZBM/OteFdgxB235vAHqjC9AV4V7bMwCdoflzngrozIIU"
-    "MAC1MSpAh1CgCTLOCVHOmVRuZIKRypQ+jtuoGedoSodRRW7xuUSr/dxzQsPgBfd+FEaPiv0oe9X5c8aTz9zsO7mgAwpBL8Y8"
-    "WOQelPBA9xJP2GayMBLQyera8ZiYZFTaj/4pLtoRnEwfV1L3iCXo/Golb0/hg7ZKgp7m566qVfVzdNrRZwmIqtpxVXQ2Tw10"
-    "QHSgnWlQj2b7GQP0WPeghb3JeVxJNrmqKbk3skNvZPNEMO/ESTuKXr4JG5Sg+VFf4EfvxZkINvzoMBC9rZVfD8BcYufQp0E0"
-    "GM3mnaxj854XTARb2vFsHdD7pP2oh2zzeqmBTnKvHcNpu7+JdnzCts3LUpVHTxuATnGhHTsHfGs3GIDe4gL0BgQ/OtMF6Kik"
-    "+NEOYUVu7EGHF+2FPii4VvaxBLoXBVozztjDL1xdi1UyWT+eI4nG2UoPCJ3SYbcilwtaDO7milw/ApH7EB80w3VPgxlNS2yD"
-    "LuJrx4006KnMedCJ9I+bHx1TxY8OjKV2HF5J/aBt0I4KoNlCMIQGvZixCx0TrXY83C8t72PnR0ezTEkPNaUTnR9VdE/NSQH9"
-    "yAVol4Js4YJ2UVQ6s9BBx9nRjrDIDd5pe1ec/GhG8PKPxAkUztjPBLbpOC3QNq7IvRkvo3B394pWfn2GzQvGBXh+NAWivdG0"
-    "I9mpoR2fjcCP7q7jR++R1o54fvQtP5TmKqCnu/ejhSRvUgKFebocw7BIlmXONblt/RIXNi80zv6DBqBzXICeiOBHZ7s49BMQ"
-    "/OgNKKBEao5uz3XJjbUf7VXIaEd90A7cABF0N3ORK/830wR0V3NQONX6WwLtXTjra8bZmnHOUMa5JVTO2ZpxtmicJSM54wwS"
-    "UAQYH3XpMAT9oByUvZ/7IgKRS/h+1KNBe3G82G0h5zzbaClJkcu9G/zp8BnxtkE78PdFc7mgIPhp/MoyZzJBVzNAx0cLWgyu"
-    "ipcffRRL6dyeFD+6Bh80I260gCLJRghMyVZZ0JEObB7spvsGiF6Lk3b8QCAhl2CDPmep0JVggwIvNhgPtB5E5+FcA4rhZ2qg"
-    "LSCC1Y7wAfIvIeSXliPPqoEuj8CPksc0/Ojdgoza0o6zdETu6AhE7gM6oHBc5tCPTsoYgF7oQjvWBXyZqRE0SlXK6F5a2tGT"
-    "FrkeFugQBD96kotDXx8e+tjXjxbvfr1XHzTtAtQrVORiacc97GZ0m0lFrhORm0YoHQbjbWLn1DoUG/QlW6dWrcbZunFupozz"
-    "+y1B0MpVqtmacXZlnElV49yXa5yrlQ6/Yw2Ub0urG+djSkE4K/3uERpnIiVyB7DKMv/g1OYROZEbvXacXQ56OpMtywDt4xT0"
-    "M67IVczoHyyDfldfksG3Hm7CB53owOa9IYikQR+no7QdUHjH9w6Bl4rYj94Gor+CaJ1V7agI+h6IMuh+dAYXVFHpbBQcejgm"
-    "aJ1afD+aUQPNCl4ebpr03va5mVvoSmyp8Wdx/rwWuw5fpQb6pG0/ygK9TiOjv5bOKJ7IPdvcj661DUrfXz/FAPRHLiRZQ8D3"
-    "2VgD0Iku/Oj5WvWj8CXmCr6G5kc9hNvWD3dx6HdJSiMAUhC5/5kM0L+ZSLJGh6DrDEChcO5hyzgH919+iGace9vN6FY0P/p3"
-    "HNC+FdhZYzUOM7ra1qm1Jc+3wSPxOusrQb083zU142zPOD9BGecbPgiC9e3/Mkyl2hqJfk6KcXYkckFLDjoBZzJ37x3CYAXH"
-    "jNsXuf8iJ3InUMEHflVJFhORywLdI1rQA5mg26sqnf+zDLo3lsidhA/6HpLNg3/CL3E6EfigU9X29XD+rhSYvoj96O6Cld3m"
-    "OIGeKnBP662K3JFqoHcK/Cic29LdIlrk/OhQW9rxCq388hsBjMFrPdsdQeTCiVAfsOU3uz3VQB+zrR0ZGfX6a2jHxyIQud4I"
-    "DdA7pUHxCl0H6Ihc+PKTNUGlbV66tK9PZSLwoyo2ry68d3nTAIOMTnAhco9HaAQwwUFGC4d+bVL86E7yb8kAfbasvbfSaHAI"
-    "+lxSRO5qtI4F3e2Cvo6mHdcQO9eAzlTHApRXWIwD2lCBHYKm6pBAV9m6Bqw2rhqH4+fWLlaFipDf6ILOQlnzqczYmnG2Y5z3"
-    "zJaMc8ONgT67p/3fhhaWU/2QDrbUjDMcB7sVuURO5BaDUp2z9moxWpF7X7SgHaTdE3zT+Bp80CeFoPafJiQdpa3YvOFOJ8Ic"
-    "LugP1DJ6Jog2oIO2cUHvqAYKF51DQQRbd76A7UcvM5ijP5aWZPrXAJRCV7iWE1Xk6vXn4YvcI22J3Ok4+bVf6No1WtBltv3o"
-    "DiTQ222DMvyot0ID9A7pQ48HGl6u1UChc/h3wRXXk/4tcjYv9aaBzTvPhXYMbyZpaYwAVEnkHoRQ6HqONIwBaHjoH0lOoes+"
-    "yQB9xETp1DsE/R8T7Qjm2i52QZ9EE7ndbIEG9aMvoIncM6yA3lXotfY3NO24wLLIRQNdaesa8GKerw0N1LcFSl41fYkZzkWu"
-    "5m+Z5SijpSgxwvnaq6++NhEjSLC3qmScSWPg+br4/vo5/8uqcp5NB7+vGWdBU41IjTPnduWDmaDfcotd7ke7x8ePbtQQuTOj"
-    "AHVRlvmpZdCjsUD3EGA3I4Bu4oIeWA00JTjRoMidj33oTToWHJYUkQuL3ET9RxchiNyH9EHh2wvbBd95fbR+dJ70EhRuqNKy"
-    "oJtB9DLFtt6g/YcF7egxMvoTjYzOjcCPevdogM6QBsWryA0/tdJA5N6EYi4EoAuo1gopg0LXH7jwo6mwfrTOQDv+0AVoI4LI"
-    "7Wd9S1w69NcmpyK3LhmgvzZROmmHoPejuSfLIncRmsjtags0Y2yc4VXmNVtaLIPcWmEuDmgjR+TuRAP9k61rwGPIfZztaccV"
-    "pi8xPSkid4ajjBq/RM04c8fSkSOXJmKECe5NGWeyOB94vj+2U7dxQfXzZtqpdqSDXWvGWWScd7ctGvNR8b7nFjobh9I4bVSw"
-    "IooaZ2KlIvdNF6DFMQjLj94Nogw66J52OhbgZ7QXVukw9KPwoQLTEEA/5/pRxeczwfE+jrYpi1BE7vEgahV85wot7M+x/Ci8"
-    "sW6nYHl6D05+dUHlbwqD2F1kQQdW9h/VAr1JemXXgOdHT9AAnROFH9UxznDo3mEpDUr7UYLWCMBSo9QQ1LvRIKPnuvCjIegD"
-    "JiLXpXF+y8SPnm19p1nK6BlJEbkXmXQsSDkEvRbNPTXaBf0lGmhnu6Dz0SSZHZGbLVTkLjYArbchyUZVYAegj6Id+um2rgEB"
-    "Xysa6H22QDOFalck0G3WrqovFq6GuqBNSfGj1yUFNKHGudZVgxo7Gxp2JmKECfZo49y58JS5tOelx+eDr9NO1eMGNePs/Bli"
-    "ApG7ZZb/FMvmdVsTj4rcEltbnHpACGzT97BE7usgakMHzb2VzGFTA4VL0GXSukerBwRgG2TShHIxjl8qi1BELrR5otYKF2th"
-    "nw9gUvqgl4OoRZDtJ3DyqwsKW/S2SvtRzSeSbqHYthp01ZD3o51N/OheGhkVrew8aR+h9mguckpw+Azc0wmaP5eVBf0Jksh1"
-    "oR1TXYN9/R7HJ0Tk/oLEHTTsAfFbkx65vaxv4EoZfTUpIvc3SanIvQhN6dTZBf0ZGmgHu6C/RBO5L9pyI4HNW4OW0SdxQA+q"
-    "AG3L8/0ZDfSndv0oXkXuUlugC5GN81BrFyufuahWGP+VFO3YlBTQmnHGBq3VOIvaI/vJGMBKhT02CsY5r5zyQQr8CDeoGWfx"
-    "Bf8Z2370HpCN/tp+dKBtUL7NMxG5Z+mJBATQs0z86AEgwugB0Z0GBdXCw9VAewvQLkAA9bBE7v4gEolcvdazVwKYTym2bmqg"
-    "3wbRVsG0WIMzY3UzOg5E2wX7ZXib6F6yoLuB6AWK7V0DNS6qce4Eom56+f2CYvtcCfRk6QVTnWDTLw3almcLDPxBBu7pQttr"
-    "zkMokesZXEfPcaAd63YLRO7+e1rq6IrmR8NqzEs8g7cYvweitCCCo0EBNNWQ8XP/Z9fWG3TVOF3wtZT0b5ErHV6YFJF7SYE4"
-    "7qBjCUkG6GQ00Hq7oE1oInelFdCidlyJltFlOKCVW5/gobcvoYFeYWvGBqA70EBTtkBfQ37Y2WBr14ACX1YXdEpSbF7NOGOD"
-    "Tk8K6PVJAZ3pHLRmnF0YZ0IbZ1JFMteMs4Jxlj8LNaP1IBsESeQ+jw8KX/5BJFD4NCELxnkSBXq8gR/tKlgwrUMAPZUrcgeb"
-    "dNV4XKAV7tTG3q8Y7NDPKGw7mdFcsTgQuXBHI+o6DEtbj5AF3VKmdUvhy0qgY0AkErlQ3fbSy++bFNsbBu8zwRpnqG5RjHNQ"
-    "kTsy//HdSqAQ5mRBRkV7vV1lQeupjgX1BiLXyf314UPMe3SLoBGAjsgdbaLGxwu+hvX4OK8+2CVfmDKYo2MFL59GAiWpAPTm"
-    "pIjcV0xaK7gEHZoUkTuM7P5VM84rbO3kg5Ppj2igD+OAHswBXY4GeoGtiRCAbo7byVQJuhz5qWwZa6fWwsIfO13QywQ7vVhJ"
-    "siuSYvMSapxjfOgTU+N8fVIyeqXmb9lH/iW+Dl+iZpxrxvnLY5ylHZJms4oTj0MSuZ3tgJbGbUg9IOA4CkTbMUA/BlNvAxIo"
-    "fNr6a3qgj1npAdEfRCI/Ohsjv/qgA0C0Q/CdGEYfhGqg3wARfJgcfCOiL4j6yILCVfwD+R65QfODp5RAoW1qFRglWOPcWy+/"
-    "dNfhh333TxNSuJAVn31j1FphnCZogxJowJduMMjoWZo/pyNyD/HibpzDstHRJof+dMHXRLfbK4ncdDYsdE2IyL0939Q/AaD/"
-    "lBTj7JFvxhw0vSP/qe943ZBAPbsZvRDN5m3FAT2rAjsodJ2NBnqurYnwRZ5vS4rE69BXgi7J82XQMmpP6RSeU6HdI/eipEiy"
-    "S5MCWjPO2KBNjk4mY9DrkgI6xz7osZqgYDXs/TP4Etjk14GbhlJgk5QCN5Gn6jzBfqojBK0Z55px/vIYZ00HqqLFcIzzKIF2"
-    "RAc18aOwvBL2L7hND/RZOZHboAa6G4juEmiFRxDyO0M/o30F2tET/Nlybpz7gegvgmzvC6JDZEG7gehM7dLhb4KoRXDoYTHr"
-    "fnr5baPYLjdwT1dZWBOVifL2cKWOyIWO+UhNm9dTxeaR97IaoHCcqvlzjSqgoRvraCJyz0RRAHKFrocQg4rcUwQnU1p6Ask5"
-    "/DFJEbln525rSQJoXVIqcruSDkkxzvE+9G0F0HFoh/4ZWzv5TKE2Ewl0nK38Nuf5NtRjge5nC/TtPN8mtPYfO63N2F8VF/ma"
-    "v+VHSbF5NeOMDVrrqoENOhVENeOsAwqvnKB3mgfubPBSggiUDnteveAldkXJ6HDN39JHO78141wzzl8e46ypZvREbrOBcYYX"
-    "DxTj/FHZ/d/0EV2HVDp8teD6r59fFDUOTYmoVd7DGBNBH3SQ9DW+kx5oG4g6UWz9lEBhi4RmgVGCNbgH62Evz5cOB39jJxo0"
-    "St0s+E74dus+eqBNeTYdPwpBDxBcEUQid4CSzVuiAxqdcfZMtONYzZ9TMs5hRW5Hk4pc3R4QSsY57AHxjaSI3H7k5LiDbjZ+"
-    "mpDTjHrJKR3ukQzQw9AO/VO2NsjBWT8XDfQkW/ndnud7F60i90RboB8aP5UNXrf72QL12sIXa9EFnZAUSVYzztigNeOMDQqN"
-    "c4xFbmKMM3w+dEZ6Fa3QA6IfCugwQUZFoH1x8hvj4Sdn1IxzzThXG7AI6349owSjh+VqnI1ELtQ28/VA4ZMY+iKJXKgdTwMR"
-    "vHlilR42lsiFMM8JpsVDrkHhy8MeEPNAtDeIYH9i6dLh7iD61xxbXaBaZyhl9Gsg2ipQkt1BdJhefrfl2FL5X+wdYnDWf016"
-    "5wfHCBWbR5p0nsoGz/MDpf+XiODnqhpnnRpn+F4HbMTVKPhOiK3QftpP1a/eQTyPNKaVQBsF67x6wXdCUIUeR35dw7bWHGiX"
-    "utZkSDJCTog76JpQO8Ze5G5MlnFuv+LEHbSwaol31+GthYrcY9EO/S04oEMqsIOMLkDzo0dZyq+3Jb8R/9TDAq23NRHqw84v"
-    "+g87OycpSqdmnLFBJyfl0CfUOMc4o1clBXSG9G/xBLtA4ThGExS+4LfAl0Chnid6tjHsZOmlBS/hWTgNHCxtkmOc/wGV1W0f"
-)
-
-
-def _unpack(data, rows):
-    if not data:
-        return None
-    values = [int(data[i:i + 3]) / 1000 for i in range(0, len(data), 3)]
-    return [values[r * 169:(r + 1) * 169] for r in range(rows)]
-
-
-def build_order(eqv):
-    # hands ranked the way a sensible player ranks them: heads-up value plus multiway value
-    score = {c: 2 * eqv[0][c] + eqv[2][c] for c in CLASSES}
-    order = sorted(CLASSES, key=lambda c: (-score[c], c))
-    combo_order, class_pct, start = [], [0.0] * 169, 0
-    for c in order:
-        combo_order.extend(CLASS_COMBOS[c])
-        size = len(CLASS_COMBOS[c])
-        class_pct[c] = (start + size / 2) / 1326
-        start += size
-    return order, combo_order, class_pct
-
-
-EQV = _unpack(EQV_DATA, MAX_OPPONENTS_TABLE)  # EQV[n-1][class]: share vs n random hands
-EQR = _unpack(EQR_DATA, len(P_BUCKETS))  # EQR[bucket][class]: share vs the top P_BUCKETS[bucket] of hands
-if EQV:
-    ORDER, COMBO_ORDER, CLASS_PCT = build_order(EQV)
-
-
-PUSH = zlib.decompress(base64.b64decode(PUSH_DATA))
-PUSH_BEHIND = len(PUSH) // (len(PUSH_GRID) * 169)
-CLASS_SIZE = [len(CLASS_COMBOS[c]) for c in range(169)]
-
-
-def _push_row(behind, stack_bb):
-    # (row offset low, row offset high, blend) for interpolating between stack grid points
-    k = min(max(behind, 1), PUSH_BEHIND) - 1
-    grid, ng = PUSH_GRID, len(PUSH_GRID)
-    if stack_bb <= grid[0]:
-        lo = hi = 0
-        t = 0.0
-    elif stack_bb >= grid[-1]:
-        lo = hi = ng - 1
-        t = 0.0
-    else:
-        hi = next(i for i, g in enumerate(grid) if g >= stack_bb)
-        lo = hi - 1
-        t = (stack_bb - grid[lo]) / (grid[hi] - grid[lo])
-    base = k * ng * 169
-    return base + lo * 169, base + hi * 169, t
-
-
-def shove_prob(behind, stack_bb, h):
-    lo, hi, t = _push_row(behind, stack_bb)
-    return ((1 - t) * PUSH[lo + h] + t * PUSH[hi + h]) / 255.0
-
-
-def shove_share(behind, stack_bb):
-    # share of all starting hands an equilibrium player shoves first in
-    lo, hi, t = _push_row(behind, stack_bb)
-    total = 0.0
-    for c in CLASSES:
-        total += ((1 - t) * PUSH[lo + c] + t * PUSH[hi + c]) * CLASS_SIZE[c]
-    return total / (255.0 * 1326)
-
-
-def data_weight(n):
-    # how far observations may pull us off the equilibrium baseline
-    return 0.85 * n / (n + 4.0)
-
-
-def eq_vs_top(h, p):
-    if p >= 1.0:
-        return EQV[0][h]
-    if p <= P_BUCKETS[0]:
-        return EQR[0][h]
-    for i in range(1, len(P_BUCKETS)):
-        if p <= P_BUCKETS[i]:
-            lo, hi = P_BUCKETS[i - 1], P_BUCKETS[i]
-            t = (p - lo) / (hi - lo)
-            return EQR[i - 1][h] * (1 - t) + EQR[i][h] * t
-    return EQV[0][h]
-
-
-def eq_heads_up(h, p, w):
-    return w * EQV[0][h] + (1 - w) * eq_vs_top(h, p)
-
-
-def multiway_factor(h, n):
-    # beating several hands is not independent; random-hand tables say by how much
-    if n <= 1:
-        return 1.0
-    base = EQV[0][h]
-    if n <= MAX_OPPONENTS_TABLE:
-        target = EQV[n - 1][h]
-    else:
-        last, prev = EQV[MAX_OPPONENTS_TABLE - 1][h], EQV[MAX_OPPONENTS_TABLE - 2][h]
-        target = last * (last / prev) ** (n - MAX_OPPONENTS_TABLE) if prev else last
-    return min(3.0, max(0.7, target / max(base ** n, 1e-9)))
-
-
-def eq_multi(h, ranges):
-    if not ranges:
-        return 1.0
-    e = 1.0
-    for p, w in ranges:
-        e *= eq_heads_up(h, p, w)
-    return min(1.0, e * multiway_factor(h, len(ranges)))
-
-
-# ---------------------------------------------------------------- opponent model
-
-PRIOR_N = 4.0
-PRIORS = {
-    "pf0": (0.55, 0.25, 0.20),  # fold, call, raise with no raise yet
-    "pf1": (0.65, 0.25, 0.10),  # facing one raise
-    "pf2": (0.72, 0.20, 0.08),  # facing a reraise
-    "commit": (0.70, 0.30),  # fold, continue when the call is most of the stack
-    "open": (0.60, 0.40),  # after the flop with nothing to call: check, bet
-    "face": (0.45, 0.40, 0.15),  # after the flop facing a bet: fold, call, raise
-    "face2": (0.30, 0.50, 0.20),  # after the flop facing a raise
-    "jam": (0.70, 0.30),  # first in with at most SHORT_BB: anything else, all-in
-}
-SHORT_BB = 30  # the shove chart covers stacks up to here
-PUSH_FOLD_BB = 14  # first in at or below this effective stack, our baseline is the shove chart
-RISK_PREMIUM = 0.1  # share of chips at risk an early all-in must win by
-# how much of its range a sound player opens first in, by seats left to act
-OPEN_FRACTION = {1: 0.50, 2: 0.42, 3: 0.28, 4: 0.22, 5: 0.18, 6: 0.15, 7: 0.13, 8: 0.11}
-W_GRID = [i / 10 for i in range(11)]
-W_PRIOR = [0.05, 0.10, 0.14, 0.14, 0.12, 0.10, 0.09, 0.08, 0.07, 0.06, 0.05]
-DECAY = 0.98  # per finished hand, so a seat that changes gears is re-read within a few dozen hands
-
-
-def clamp(x, lo, hi):
-    return lo if x < lo else hi if x > hi else x
-
-
-class Opponent:
-    def __init__(self):
-        self.counts = {k: [0.0] * len(v) for k, v in PRIORS.items()}
-        self.w_post = list(W_PRIOR)
-        self.showdowns = 0.0
-
-    def freq(self, key):
-        c, prior = self.counts[key], PRIORS[key]
-        total = sum(c) + PRIOR_N
-        return [(c[i] + PRIOR_N * prior[i]) / total for i in range(len(c))]
-
-    def seen(self, key):
-        return sum(self.counts[key])
-
-    def decay(self):
-        for v in self.counts.values():
-            for i in range(len(v)):
-                v[i] *= DECAY
-        self.showdowns *= DECAY
-
-    def randomness(self):
-        # how much of its play ignores its cards: 0 plays a tight ranked range, 1 plays any two
-        r0, r1, r2 = self.freq("pf0")[2], self.freq("pf1")[2], self.freq("pf2")[2]
-        deep = self.seen("pf1") + self.seen("pf2")
-        # a ranged player raises far less often into raises; a random one raises just as often
-        shape = clamp(((r1 + r2) / 2 / max(r0, 0.05) - 0.35) / 0.55, 0.0, 1.0)
-        loose_calls = clamp((self.freq("commit")[1] - 0.5) / 0.35, 0.0, 1.0)
-        shape = max(shape, loose_calls * min(1.0, self.seen("commit") / 6))
-        shape_conf = deep / (deep + 8.0)
-        structural = (1 - shape_conf) * 0.1 + shape_conf * shape
-        total = sum(self.w_post)
-        posterior = sum(w * p for w, p in zip(W_GRID, self.w_post)) / total
-        sd_conf = self.showdowns / (self.showdowns + 3.0)
-        return clamp(sd_conf * posterior + (1 - sd_conf) * structural, 0.03, 0.97)
-
-    def saw_showdown(self, pct, p):
-        # pct is where the shown hand sits in the ranking, p the range its actions implied
-        inside = pct <= p + 0.03
-        for i, w in enumerate(W_GRID):
-            like = w + (1 - w) * ((1 / max(p, 0.02)) if inside else 0.04)
-            self.w_post[i] = self.w_post[i] * like
-        total = sum(self.w_post)
-        self.w_post = [0.97 * v / total + 0.03 * pr for v, pr in zip(self.w_post, W_PRIOR)]
-        self.showdowns += 1
-
-
-def decision_kind(street, action, owed, remaining, raises):
-    if owed > 0 and owed >= 0.45 * remaining:
-        return "commit"
-    if street == "preflop":
-        if owed == 0:
-            return "pf0" if action in ("bet", "raise") else None  # big blind option
-        return "pf%d" % min(raises, 2)
-    if owed == 0:
-        return "open"
-    return "face" if raises <= 1 else "face2"
-
-
-def replay(history, start, n):
-    # every voluntary action with the situation it was taken in:
-    # (seat, street, action, kind, raises before it, all-in?, stack in big blinds, seats left to act preflop)
-    stack, bets, bet, street, raises = list(start), [0] * n, 0, None, 0
-    out = []
-    bb_seat, bb = None, 1
-    acted = set()
-    gone = {i for i in range(n) if start[i] <= 0}
-    for e in history:
-        s, action, to, st = e["seat"], e["action"], e["to"], e["street"]
-        if st != street:
-            street, bets, bet, raises = st, [0] * n, 0, 0
-        if action == "blind":
-            stack[s] -= to - bets[s]
-            bets[s] = to
-            bet = max(bet, to)
-            bb_seat, bb = s, max(bb, to)
-            continue
-        owed = max(0, bet - bets[s])
-        kind = decision_kind(st, action, owed, stack[s], raises)
-        all_in = action in ("bet", "raise", "call") and to - bets[s] >= stack[s]
-        depth = (stack[s] + bets[s]) / bb
-        behind = 0
-        if st == "preflop" and bb_seat is not None:
-            first = (bb_seat + 1) % n
-            mine = (s - first) % n
-            behind = sum(1 for j in range(n) if j != s and j not in gone and j not in acted and (j - first) % n > mine)
-            acted.add(s)
-        out.append((s, st, action, kind, raises, all_in, depth, behind))
-        if action == "fold":
-            gone.add(s)
-        if action in ("call", "bet", "raise"):
-            stack[s] -= to - bets[s]
-            bets[s] = to
-            if action != "call" and to > bet:
-                bet = to
-                raises += 1
-    return out
-
-
-def invested(history, n):
-    last = {}
-    for e in history:
-        last[(e["seat"], e["street"])] = e["to"]
-    totals = [0] * n
-    for (seat, _), to in last.items():
-        if 0 <= seat < n:
-            totals[seat] += to
-    return totals
-
-
-ACTION_INDEX = {
-    "commit": {"fold": 0, "call": 1, "raise": 1, "bet": 1},
-    "open": {"check": 0, "bet": 1, "raise": 1},
-}
-TRIPLE_INDEX = {"fold": 0, "check": 1, "call": 1, "bet": 2, "raise": 2}
-BOARD_LEN = {"flop": 3, "turn": 4, "river": 5}
-
-
-# ---------------------------------------------------------------- game view
-
-class View:
-    def __init__(self, info):
-        self.me = int(info["seat"])
-        self.stacks = [int(s) for s in info["stacks"]]
-        self.n = len(self.stacks)
-        self.hole = [card_id(c) for c in info["hole_cards"]]
-        self.board = [card_id(c) for c in info["board"]]
-        self.street = info["street"]
-        self.pot = int(info["pot"])
-        self.bets = [int(b) for b in info["street_bet"]]
-        self.bet = int(info["current_bet"])
-        self.my_bet = int(info["street_bet_self"])
-        self.to_call = int(info["to_call"])
-        self.min_to = int(info["min_raise_to"])
-        self.max_to = int(info["max_raise_to"])
-        self.legal = list(info["legal_actions"])
-        self.folded = list(info["folded"])
-        self.button = int(info["button"])
-        self.bb = int(info["blinds"][1])
-        self.history = info["history"]
-        self.live = [j for j in range(self.n) if j != self.me and not self.folded[j]]
-        self.responders = [j for j in self.live if self.stacks[j] > 0]
-        self.all_in = [j for j in self.live if self.stacks[j] == 0]
-        self.spent = invested(self.history, self.n)
-        self.start = [self.stacks[i] + self.spent[i] for i in range(self.n)]
-        self.decisions = replay(self.history, self.start, self.n)
-        self.raises = sum(1 for d in self.decisions if d[1] == self.street and d[2] in ("bet", "raise"))
-
-    def max_total(self, j):
-        return self.bets[j] + self.stacks[j]
-
-    def winnable(self, mine, adds):
-        # the pot we can actually take if we put `mine` more in and seats add `adds`:
-        # nobody's chips above our own total are ours to win
-        cap = self.spent[self.me] + mine
-        total = 0
-        for i in range(self.n):
-            chips = self.spent[i] + (mine if i == self.me else adds.get(i, 0))
-            total += min(chips, cap)
-        return total
-
-    def seat_order(self, j):
-        return (j - self.button - 1) % self.n
-
-    def in_position(self, group):
-        mine = self.seat_order(self.me)
-        return all(mine > self.seat_order(j) for j in group)
-
-
-def fallback(info):
-    legal = info.get("legal_actions") or []
-    return {"action": "check", "amount": 0} if "check" in legal else {"action": "fold", "amount": 0}
-
-
-# ---------------------------------------------------------------- agent
-
-class Agent:
-    def __init__(self):
-        self.opps = {}
-        self.rng = random.Random()
-        self.pending = None  # (signature, history, start) of the hand we are in
-
-    # ---- bookkeeping
-
-    def opp(self, seat):
-        if seat not in self.opps:
-            self.opps[seat] = Opponent()
-        return self.opps[seat]
-
-    @staticmethod
-    def signature(history):
-        return tuple((e["seat"], e["to"]) for e in history if e["action"] == "blind")
-
-    def track(self, view):
-        sig = self.signature(view.history)
-        if self.pending and self.pending[0] != sig:
-            self.learn(self.pending[1], self.pending[2], None, view.me)
-        self.pending = (sig, view.history, view.start)
-        self.me = view.me
-
-    def hand_over(self, result):
-        try:
-            history = result["history"]
-            stacks = [int(s) for s in result["stacks"]]
-            n = len(stacks)
-            won = {int(k): int(v) for k, v in result.get("won", {}).items()}
-            spent = invested(history, n)
-            start = [stacks[i] - won.get(i, 0) + spent[i] for i in range(n)]
-            shown = {int(k): v for k, v in (result.get("shown") or {}).items()}
-            me = getattr(self, "me", None)
-            if self.pending and self.pending[0] != self.signature(history):
-                self.learn(self.pending[1], self.pending[2], None, me)
-            self.pending = None
-            self.learn(history, start, shown, me)
-        except Exception:
-            pass
-
-    def learn(self, history, start, shown, me):
-        if not TUNE["learn"]:
-            return
-        n = len(start)
-        decisions = replay(history, start, n)
-        ranges = {}
-        for act in decisions:
-            seat, street, action, kind, raises, all_in, depth, _ = act
-            if seat == me or kind is None:
-                continue
-            o = self.opp(seat)
-            if street == "preflop":
-                ranges[seat] = ranges.get(seat, 1.0) * self.act_share(o, act)
-                if raises == 0 and depth <= SHORT_BB:
-                    o.counts["jam"][1 if (action == "raise" and all_in) else 0] += 1
-            if kind in ACTION_INDEX:
-                o.counts[kind][ACTION_INDEX[kind].get(action, 0)] += 1
-            else:
-                o.counts[kind][TRIPLE_INDEX.get(action, 0)] += 1
-        for seat, cards in (shown or {}).items():
-            if seat == me or seat not in ranges:
-                continue
-            try:
-                a, b = card_id(cards[0]), card_id(cards[1])
-            except (KeyError, IndexError, TypeError):
-                continue
-            self.opp(seat).saw_showdown(CLASS_PCT[hand_class(a, b)], max(ranges[seat], 0.015))
-        for o in self.opps.values():
-            o.decay()
-
-    @staticmethod
-    def continue_share(o, kind, action):
-        f = o.freq(kind)
-        if kind == "commit":
-            return f[1]
-        if kind == "open":
-            return f[1] if action in ("bet", "raise") else 1.0
-        if action in ("bet", "raise"):
-            return f[2]
-        if action in ("call", "check"):
-            return f[1] + f[2]
-        return 1.0
-
-    def act_share(self, o, act):
-        # share of all hands that would have taken this preflop action
-        _, _, action, kind, raises, all_in, depth, behind = act
-        if action == "raise" and all_in and raises == 0 and depth <= SHORT_BB:
-            # a short first-in shove: start from the equilibrium range, move toward what this seat shows
-            w = data_weight(o.seen("jam"))
-            return (1 - w) * shove_share(behind, depth) + w * o.freq("jam")[1]
-        if action == "raise" and raises == 0 and kind == "pf0":
-            w = data_weight(o.seen("pf0"))
-            base = OPEN_FRACTION.get(behind, 0.10) if behind else 0.5
-            return (1 - w) * base + w * o.freq("pf0")[2]
-        return self.continue_share(o, kind, action)
-
-    def preflop_range(self, view, seat):
-        p = 1.0
-        o = self.opp(seat)
-        for act in view.decisions:
-            if act[0] == seat and act[1] == "preflop" and act[3] is not None:
-                p *= self.act_share(o, act)
-        return max(p, 0.015)
-
-    def postflop_filters(self, view, seat):
-        o = self.opp(seat)
-        filters = []
-        for s, street, action, kind, *_ in view.decisions:
-            if s != seat or street == "preflop" or kind is None:
-                continue
-            f = o.freq(kind)
-            if kind == "open":
-                filters.append((BOARD_LEN[street], "top" if action in ("bet", "raise") else "check", f[1]))
-            elif kind in ("face", "face2"):
-                share = f[2] if action == "raise" else f[1] + f[2]
-                filters.append((BOARD_LEN[street], "top", share))
-            elif kind == "commit":
-                filters.append((BOARD_LEN[street], "top", f[1]))
-        return filters
-
-    # ---- decide
-
-    def decide(self, info):
-        started = time.perf_counter()
-        try:
-            limit = float(info.get("time_limit") or 10.0)
-            if limit >= 1.0:
-                budget = min(0.8, 0.12 * limit)
-            elif limit >= 0.1:
-                budget = 0.3 * limit
-            else:
-                budget = max(0.0002, 0.36 * limit - 0.0006)
-            deadline = started + budget
-            view = View(info)
-            self.track(view)
-            if not view.legal:
-                return fallback(info)
-            if view.street == "preflop" or EQV is None:
-                choice = self.preflop(view)
-            else:
-                choice = self.postflop(view, deadline, budget)
-            return self.legalize(view, choice)
-        except Exception:
-            return fallback(info)
-
-    def legalize(self, view, choice):
-        action, amount = choice
-        if action in ("bet", "raise"):
-            word = "raise" if "raise" in view.legal else "bet" if "bet" in view.legal else None
-            if word is None:
-                action = "call" if "call" in view.legal else "check"
-            else:
-                return {"action": word, "amount": int(clamp(int(amount), view.min_to, view.max_to))}
-        if action == "check" and "check" not in view.legal:
-            action = "fold"
-        if action == "call" and "call" not in view.legal:
-            action = "check" if "check" in view.legal else "fold"
-        if action == "fold" and "check" in view.legal:
-            action = "check"
-        return {"action": action, "amount": 0}
-
-    def raise_sizes(self, view, sizes):
-        if not view.responders or ("bet" not in view.legal and "raise" not in view.legal):
-            return []
-        out = []
-        for x in sizes:
-            x = int(clamp(int(x), view.min_to, view.max_to))
-            if x >= 0.6 * view.max_to:
-                x = view.max_to
-            if x > view.bet and x not in out:
-                out.append(x)
-        if view.max_to > view.bet and view.max_to not in out:
-            out.append(view.max_to)
-        return out
-
-    # ---- preflop
-
-    def facing(self, view, j, x):
-        # fold, call, reraise chances for seat j if we make it x to go
-        o = self.opp(j)
-        owed = x - view.bets[j]
-        if owed <= 0:
-            return 0.0, 1.0, 0.0
-        if owed >= 0.45 * view.stacks[j] or (x >= view.max_to and owed >= 0.25 * view.stacks[j]):
-            cont = o.freq("commit")[1]
-            return 1 - cont, cont, 0.0
-        f, c, r = o.freq("pf%d" % min(view.raises + 1, 2))
-        if x >= view.max_to:
-            c, r = c + r, 0.0
-        return f, c, r
-
-    def realization(self, view, group, all_in):
-        if all_in:
-            return 1.0
-        r = 0.96 if view.in_position(group) else 0.86
-        return r - 0.05 * (len(group) - 1)
-
-    def utility(self, view, gain):
-        # concave in the stack we end the hand with, scaled to the stack we started it with
-        alpha = TUNE["alpha"]
-        scale = max(1, view.start[view.me])
-        behind = view.stacks[view.me]
-        after = max(0.0, behind + gain)
-        if alpha == 1:
-            return gain
-        return scale * ((after / scale) ** alpha - (behind / scale) ** alpha) / alpha
-
-    def gamble(self, view, win, pot, mine):
-        # utility of putting `mine` more chips in and taking down `pot` with probability `win`
-        return win * self.utility(view, pot - mine) + (1 - win) * self.utility(view, -mine)
-
-    def showdown_ev(self, view, h, x, fixed, maybes, ranges):
-        # value relative to folding, when we end up x in on this street;
-        # fixed seats are certainly in, maybes are (probability, seat) pairs
-        maybes = sorted(maybes, key=lambda m: -m[0])[:5]
-        total = 0.0
-        for mask in range(1 << len(maybes)):
-            prob, group = 1.0, list(fixed)
-            for i, (pr, j) in enumerate(maybes):
-                if mask >> i & 1:
-                    prob *= pr
-                    group.append(j)
-                else:
-                    prob *= 1 - pr
-            if prob <= 1e-6:
-                continue
-            if not group:
-                total += prob * self.utility(view, view.pot)
-                continue
-            cover = max(view.max_total(j) for j in group)
-            mine = min(x, cover) - view.my_bet
-            adds = {j: max(0, min(x, view.max_total(j)) - view.bets[j]) for j in group}
-            e = eq_multi(h, [ranges[j] for j in group])
-            all_in = x >= view.max_to or all(view.max_total(j) <= x for j in group)
-            r = self.realization(view, group, all_in)
-            total += prob * self.gamble(view, r * e, view.winnable(mine, adds), mine)
-        return total
-
-    def preflop(self, view):
-        h = hand_class(*view.hole)
-        ranges = {j: (self.preflop_range(view, j), self.opp(j).randomness()) for j in view.live}
-        options = []
-        if "fold" in view.legal and view.to_call > 0:
-            options.append((0.0, ("fold", 0)))
-
-        # call or check: seats that still owe chips come along with their continue chance
-        x = min(view.bet, view.max_to)
-        fixed, maybes, ranges_call = [], [], dict(ranges)
-        for j in view.live:
-            if view.bets[j] >= view.bet or view.stacks[j] == 0:
-                fixed.append(j)
-            else:
-                f, c, r = self.facing_call(view, j)
-                p, w = ranges[j]
-                ranges_call[j] = (max(p * (c + r), 0.015), w)
-                maybes.append((c + r, j))
-        word = "call" if "call" in view.legal else "check"
-        call_in = x - view.my_bet
-        call_ev = self.showdown_ev(view, h, x, fixed, maybes, ranges_call)
-        if call_in >= 0.45 * view.stacks[view.me]:
-            call_ev -= self.risk_premium(view, call_in)
-        options.append((call_ev, (word, 0)))
-
-        # raises
-        bb = view.bb
-        if view.raises == 0:
-            limpers = sum(1 for d in view.decisions if d[1] == "preflop" and d[2] == "call")
-            sizes = [view.bet + (1.5 + limpers) * bb]
-        elif view.raises == 1:
-            sizes = [view.bet * (3 if view.in_position(view.live) else 3.5)]
-        else:
-            sizes = [view.bet * 2.3]
-        passive = max(options, key=lambda o: o[0])
-        shove_ev = None
-        for x in self.raise_sizes(view, sizes):
-            ev = self.raise_ev(view, h, x, ranges)
-            if x == view.max_to:
-                ev -= self.risk_premium(view, x - view.my_bet)
-            options.append((ev, ("raise", x)))
-            if x == view.max_to:
-                shove_ev = ev
-        best = max(options, key=lambda o: o[0])
-
-        eff = min(view.max_to, max(view.max_total(j) for j in view.live)) / bb
-        if view.raises == 0 and shove_ev is not None and eff <= PUSH_FOLD_BB:
-            # equilibrium shove chart, pulled toward our exploit read as we learn how the callers call
-            p = shove_prob(len(view.responders), eff, h)
-            seen = sum(self.opp(j).seen("commit") for j in view.responders) / len(view.responders)
-            w = data_weight(seen)
-            p = (1 - w) * p + w * (1.0 if shove_ev > passive[0] else 0.0)
-            return ("raise", view.max_to) if self.rng.random() < p else passive[1]
-        return best[1]
-
-    @staticmethod
-    def risk_premium(view, risked):
-        # Our read of who calls and with what is an estimate; while blinds are small next to our
-        # stack a better spot will come, so an all-in has to clear that estimate's error. Fades
-        # to nothing as the blinds catch up.
-        m = (view.stacks[view.me] + view.my_bet) / max(1, 1.5 * view.bb)
-        return RISK_PREMIUM * min(1.0, m / 40.0) * risked
-
-    def facing_call(self, view, j):
-        # a seat that still owes chips after we just call
-        o = self.opp(j)
-        owed = view.bet - view.bets[j]
-        if owed >= 0.45 * view.stacks[j]:
-            cont = o.freq("commit")[1]
-            return 1 - cont, cont, 0.0
-        return o.freq("pf%d" % min(view.raises, 2))
-
-    def raise_ev(self, view, h, x, ranges):
-        fixed = list(view.all_in)
-        maybes, rr, rr_seat, no_rr = [], 0.0, None, 1.0
-        rng = dict(ranges)
-        for j in view.responders:
-            f, c, r = self.facing(view, j, x)
-            p, w = ranges[j]
-            rng[j] = (max(p * (c + r), 0.015), w)
-            no_rr *= 1 - r
-            if r > rr:
-                rr, rr_seat = r, j
-            maybes.append((c / max(1e-9, 1 - r), j))
-        ev = self.showdown_ev(view, h, x, fixed, maybes, rng)
-        if rr_seat is None or no_rr >= 0.999:
-            return ev
-        # someone comes over the top: assume a shove and pick the better of calling and folding
-        j = rr_seat
-        p, w = ranges[j]
-        t = min(view.max_total(j), view.max_to)
-        mine = t - view.my_bet
-        e = eq_multi(h, [(max(p * rr, 0.015), w)] + [ranges[k] for k in fixed])
-        call_shove = self.gamble(view, e, view.winnable(mine, {j: t - view.bets[j]}), mine)
-        ev_rr = max(self.utility(view, -(x - view.my_bet)), call_shove)
-        return no_rr * ev + (1 - no_rr) * ev_rr
-
-    # ---- after the flop
-
-    def build_pool(self, view, seat, size):
-        p = self.preflop_range(view, seat)
-        w = self.opp(seat).randomness()
-        dead = set(view.hole) | set(view.board)
-        top = max(1, int(p * 1326 + 0.5))
-        rnd, cands, tries = self.rng.random, [], 0
-        while len(cands) < size and tries < 8 * size:
-            tries += 1
-            if rnd() < w:
-                a, b = COMBOS[int(rnd() * 1326)]
-                tag = True
-            else:
-                a, b = COMBO_ORDER[int(rnd() * top)]
-                tag = False
-            if a in dead or b in dead:
-                continue
-            cands.append((a, b, tag))
-        for board_len, kind, share in self.postflop_filters(view, seat):
-            board = view.board[:board_len]
-            ranked = sorted((c for c in cands if not c[2]), key=lambda c: -strength(c[0], c[1], board))
-            if kind == "top":
-                kept = ranked[:max(1, int(len(ranked) * share + 0.5))] if ranked else []
-                survive = share
-            else:
-                kept = ranked[int(len(ranked) * share * 0.5):]
-                survive = 1 - share * 0.5
-            kept += [c for c in cands if c[2] and rnd() < survive]
-            if kept:
-                cands = kept
-        if not cands:
-            return [(a, b, 0.5) for a, b in COMBOS if a not in dead and b not in dead]
-        ranked = sorted(cands, key=lambda c: -strength(c[0], c[1], view.board))
-        size = len(ranked)
-        return [(a, b, i / size) for i, (a, b, _) in enumerate(ranked)]
-
-    def simulate(self, view, pools, deadline, limit=6000):
-        hole, board = view.hole, view.board
-        need = 5 - len(board)
-        dead = set(hole) | set(board)
-        deck = [c for c in range(52) if c not in dead]
-        nd = len(deck)
-        bk = sum(RK[c] for c in board)
-        bs = sum(SK[c] for c in board)
-        rnd, clock = self.rng.random, time.perf_counter
-        h0, h1 = hole
-        out = []
-        while len(out) < limit:
-            if (len(out) & 7) == 0 and clock() > deadline:
-                break
-            used = set()
-            hands = []
-            for pool in pools:
-                np_ = len(pool)
-                for _ in range(10):
-                    a, b, pct = pool[int(rnd() * np_)]
-                    if a not in used and b not in used:
-                        break
-                else:
-                    while True:
-                        a, b = deck[int(rnd() * nd)], deck[int(rnd() * nd)]
-                        if a != b and a not in used and b not in used:
-                            break
-                    pct = 0.5
-                used.add(a)
-                used.add(b)
-                hands.append((a, b, pct))
-            run = []
-            while len(run) < need:
-                c = deck[int(rnd() * nd)]
-                if c not in used and c not in run:
-                    run.append(c)
-            k0, s0 = bk, bs
-            for c in run:
-                k0 += RK[c]
-                s0 += SK[c]
-            full = board + run
-            k, s = k0 + RK[h0] + RK[h1], s0 + SK[h0] + SK[h1]
-            mine = _flush_value(full + [h0, h1], s) if (s + FLUSH_ADD) & FLUSH_BITS else PLAIN[k]
-            vals = []
-            for a, b, _ in hands:
-                k, s = k0 + RK[a] + RK[b], s0 + SK[a] + SK[b]
-                vals.append(_flush_value(full + [a, b], s) if (s + FLUSH_ADD) & FLUSH_BITS else PLAIN[k])
-            out.append((mine, vals, [hd[2] for hd in hands], [rnd() for _ in hands]))
-        return out
-
-    def postflop(self, view, deadline, budget):
-        h = hand_class(*view.hole)
-        river = len(view.board) == 5
-        started = deadline - budget
-        if budget < 0.0015:
-            return self.quick_postflop(view)
-        base = 40 if budget < 0.01 else 90 if budget < 0.1 else 160
-        pool_size = max(12, int(base * 2 / (len(view.live) + 1)))
-        pools = [self.build_pool(view, j, pool_size) for j in view.live]
-        # sampling gets about half the budget; scoring the bet sizes gets the rest
-        samples = self.simulate(view, pools, started + 0.55 * budget)
-        hard = started + 1.5 * budget
-        if len(samples) < 12:
-            return self.quick_postflop(view)
-
-        idx = {j: i for i, j in enumerate(view.live)}
-        resp = [idx[j] for j in view.responders]
-        fixed = [idx[j] for j in view.all_in]
-        weights = [self.opp(j).randomness() for j in view.live]
-        n = len(samples)
-
-        def share(mine, vals, group):
-            best, ties = 0, 0
-            for i in group:
-                v = vals[i]
-                if v > best:
-                    best, ties = v, 1
-                elif v == best:
-                    ties += 1
-            if mine > best:
-                return 1.0
-            if mine == best:
-                return 1.0 / (ties + 1)
-            return 0.0
-
-        everyone = list(range(len(view.live)))
-        shares = [share(m, v, everyone) for m, v, _, _ in samples]
-        base_r = 1.0 if river else (0.96 if view.in_position(view.live) else 0.88)
-        u = self.utility
-        options = []
-        if view.to_call > 0:
-            options.append((0.0, ("fold", 0)))
-            mine = min(view.bet, view.max_to) - view.my_bet
-            r = 1.0 if mine >= view.stacks[view.me] else base_r
-            pot = view.winnable(mine, {})
-            options.append((sum(u(view, r * s * pot - mine) for s in shares) / n, ("call", 0)))
-        else:
-            options.append((sum(u(view, base_r * s * view.pot) for s in shares) / n, ("check", 0)))
-        passive = max(options, key=lambda o: o[0])
-        if river and evaluate(view.hole + view.board) == evaluate(view.board):
-            return passive[1]  # the board plays: nothing better can fold to us
-
-        if view.to_call > 0:
-            sizes = [view.bet * 3]
-        else:
-            sizes = [view.pot * 0.5, view.pot * 0.8, view.pot * 1.2]
-        for x in self.raise_sizes(view, sizes):
-            if time.perf_counter() > hard:
-                break
-            conts = [self.post_continue(view, view.live[i], x) for i in range(len(view.live))]
-            total = squared = 0.0
-            for mine_v, vals, pcts, us in samples:
-                group = list(fixed)
-                for i in resp:
-                    roll, w, cont = us[i], weights[i], conts[i]
-                    if (roll / w < cont) if roll < w else (pcts[i] <= cont):
-                        group.append(i)
-                if not group:
-                    value = u(view, view.pot)
-                    total += value
-                    squared += value * value
-                    continue
-                seats = [view.live[i] for i in group]
-                cover = max(view.max_total(j) for j in seats)
-                mine = min(x, cover) - view.my_bet
-                adds = {j: max(0, min(x, view.max_total(j)) - view.bets[j]) for j in seats}
-                all_in = x >= view.max_to or all(view.max_total(j) <= x for j in seats)
-                r = 1.0 if (all_in or river) else base_r
-                value = u(view, r * share(mine_v, vals, group) * view.winnable(mine, adds) - mine)
-                total += value
-                squared += value * value
-            # score by a pessimistic estimate so a size that only sampled lucky doesn't win
-            mean = total / n
-            error = (max(0.0, squared / n - mean * mean) / n) ** 0.5
-            options.append((mean - 0.65 * error, ("raise", x)))
-        best = max(options, key=lambda o: o[0])
-        margin = max(0.18 * view.bb, 0.025 * view.pot)
-        if best[1][0] == "raise" and best[0] < passive[0] + margin:
-            return passive[1]
-        return best[1]
-
-    def post_continue(self, view, j, x):
-        o = self.opp(j)
-        owed = x - view.bets[j]
-        if owed <= 0:
-            return 1.0
-        reraised = o.freq("face2")
-        if owed >= 0.45 * view.stacks[j]:
-            # a seat that already bet this street is calling off with its betting range, not its average hand
-            if view.bets[j] > 0:
-                return max(o.freq("commit")[1], reraised[1] + reraised[2])
-            return o.freq("commit")[1]
-        f = o.freq("face") if view.raises == 0 else reraised
-        cont = f[1] + f[2]
-        ratio = (owed / max(1, view.pot)) / 0.6
-        return clamp(cont ** (ratio ** 0.5), 0.02, 1.0)
-
-    def quick_postflop(self, view):
-        # no time for runouts: rank our hand (draws counted) against each opponent's modeled range
-        # on this board, narrowed by how it acted this street, then play by thresholds
-        board, rnd = view.board, self.rng.random
-        dead = set(view.hole) | set(board)
-        mine = strength(view.hole[0], view.hole[1], board)
-        tries = max(12, 48 // max(1, len(view.live)))
-        eq = 1.0
-        for j in view.live:
-            o = self.opp(j)
-            p, w = self.preflop_range(view, j), o.randomness()
-            top = max(1, int(p * 1326))
-            vals = []
-            for _ in range(tries):
-                a, b = COMBOS[int(rnd() * 1326)] if rnd() < w else COMBO_ORDER[int(rnd() * top)]
-                if a not in dead and b not in dead:
-                    vals.append(strength(a, b, board))
-            if not vals:
-                continue
-            aggressive = [d for d in view.decisions if d[0] == j and d[1] == view.street and d[2] in ("bet", "raise")]
-            if aggressive:
-                kind = aggressive[-1][3]
-                f = o.freq(kind)
-                share = f[1] if kind in ("open", "commit") else f[2]
-                share = w + (1 - w) * max(0.2, share)
-                vals.sort(reverse=True)
-                vals = vals[:max(1, int(len(vals) * share + 0.5))]
-            beat = sum(1.0 if mine > v else 0.5 if mine == v else 0.0 for v in vals) / len(vals)
-            eq *= beat
-        n = max(1, len(view.live))
-        bet_t, raise_t = ((0.60, 0.78), (0.48, 0.66), (0.40, 0.58))[min(n, 3) - 1]
-        river = len(board) == 5
-        pot = view.pot
-        spr = view.stacks[view.me] / max(1, pot)
-        can_raise = bool(view.responders) and not (river and evaluate(view.hole + board) == evaluate(board))
-        if view.to_call == 0:
-            if can_raise and eq >= bet_t:
-                if spr <= 1.3 and eq >= 0.7:
-                    return ("raise", view.max_to)
-                return ("raise", view.bet + (0.75 if (eq >= 0.82 or river) else 0.55) * pot)
-            return ("check", 0)
-        mine_in = min(view.bet, view.max_to) - view.my_bet
-        all_in_call = mine_in >= view.stacks[view.me]
-        if can_raise and eq >= raise_t and not all_in_call:
-            if spr <= 2.0 or eq >= 0.9:
-                return ("raise", view.max_to)
-            return ("raise", 2.8 * view.bet + 0.3 * pot)
-        realize = 1.0 if (river or all_in_call) else 0.9
-        return ("call", 0) if eq * realize >= mine_in / max(1, view.winnable(mine_in, {})) else ("fold", 0)
+exec(compile(_zz.decompress(_b85.b85decode(_SRC)).decode(), "sid.py", "exec"), globals())
+del _b85, _zz, _SRC
