@@ -1,0 +1,142 @@
+@import "tailwindcss";
+
+/* one family, three radii: md for cards, xl for panels, full for pills and avatars */
+@theme inline {
+  --font-sans: var(--font-geist-sans);
+  --radius-md: 6px;
+  --radius-xl: 12px;
+  --color-page: #f3f3f1;
+  --color-surface: #fbfbfa;
+  --color-panel: #ffffff;
+  --color-line: #e4e4e0;
+  --default-transition-duration: 150ms;
+  --default-transition-timing-function: cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+:root {
+  color-scheme: light;
+}
+
+body {
+  min-height: 100vh;
+  background: var(--color-page);
+  color: #18181b;
+  font-variant-numeric: tabular-nums;
+}
+
+::selection {
+  background: #e4e4e0;
+  color: #18181b;
+}
+
+:focus-visible {
+  outline: 2px solid #18181b;
+  outline-offset: 2px;
+}
+
+.card-face {
+  background: #ffffff;
+  border: 1px solid #e4e4e7;
+  box-shadow: 0 3px 8px -3px rgba(24, 24, 27, 0.18);
+  font-variant-emoji: text;
+  animation: deal-in 0.4s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+.chip {
+  width: 20px;
+  height: 20px;
+  border-radius: 9999px;
+  background: var(--chip);
+  border: 3px dashed rgba(255, 255, 255, 0.85);
+  box-shadow: 0 2px 3px rgba(24, 24, 27, 0.25);
+}
+
+/* chips travel in a straight flight; the ring below stays linear because it is a clock */
+.fly-x {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 0;
+  animation: fly-x 0.45s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+.fly-y {
+  position: absolute;
+  left: 0;
+  animation: fly-y 0.45s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+.fly-spin {
+  animation: fly-spin 0.45s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+.timer-ring {
+  stroke-dasharray: var(--c);
+  animation: ring-drain var(--limit) linear both;
+}
+
+.pop-in {
+  animation: pop-in 0.3s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+.float-up {
+  animation: float-up 1.2s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+@keyframes fly-x {
+  from { left: var(--x0); }
+  to { left: var(--x1); }
+}
+
+@keyframes fly-y {
+  from { top: var(--y0); }
+  to { top: var(--y1); }
+}
+
+@keyframes fly-spin {
+  0% { transform: translate(-50%, -50%) scale(0.92); opacity: 0; }
+  18% { opacity: 1; }
+  100% { transform: translate(-50%, -50%) scale(1) rotate(60deg); opacity: 0; }
+}
+
+@keyframes ring-drain {
+  0% { stroke-dashoffset: 0; stroke: #737373; }
+  55% { stroke: #18181b; }
+  100% { stroke-dashoffset: var(--c); stroke: #b91c1c; }
+}
+
+@keyframes deal-in {
+  from { opacity: 0; transform: translateY(-8px) rotateY(70deg); }
+  to { opacity: 1; transform: none; }
+}
+
+@keyframes pop-in {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: none; }
+}
+
+@keyframes float-up {
+  0% { opacity: 0; transform: translate(-50%, 8px); }
+  20% { opacity: 1; }
+  70% { opacity: 1; }
+  100% { opacity: 0; transform: translate(-50%, -16px); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-delay: 0ms !important;
+  }
+}
+
+.feed-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: #d4d4d0 transparent;
+}
+
+input[type="range"] {
+  width: 144px;
+  height: 16px;
+  accent-color: #18181b;
+  cursor: pointer;
+}
