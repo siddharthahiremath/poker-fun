@@ -1,274 +1,260 @@
-import random
-import time
-import math
-from collections import defaultdict
-
-class HandStrengthEvaluator:
-    def __init__(self):
-        self.hand_rankings = {
-            'high_card': 1,
-            'pair': 2,
-            'two_pair': 3,
-            'three_of_a_kind': 4,
-            'straight': 5,
-            'flush': 6,
-            'full_house': 7,
-            'four_of_a_kind': 8,
-            'straight_flush': 9
-        }
-
-    def evaluate(self, hole_cards, community_cards):
-        cards = hole_cards + community_cards
-        suits = [card[1] for card in cards]
-        values = [card[0] for card in cards]
-
-        value_counts = defaultdict(int)
-        for value in values:
-            value_counts[value] += 1
-
-        is_flush = len(set(suits)) == 1
-        is_straight = self.is_straight(values)
-
-        if is_straight and is_flush:
-            return self.hand_rankings['straight_flush']
-        elif max(value_counts.values()) == 4:
-            return self.hand_rankings['four_of_a_kind']
-        elif set(value_counts.values()) == {3, 2}:
-            return self.hand_rankings['full_house']
-        elif is_flush:
-            return self.hand_rankings['flush']
-        elif is_straight:
-            return self.hand_rankings['straight']
-        elif max(value_counts.values()) == 3:
-            return self.hand_rankings['three_of_a_kind']
-        elif list(value_counts.values()).count(2) == 2:
-            return self.hand_rankings['two_pair']
-        elif 2 in value_counts.values():
-            return self.hand_rankings['pair']
-        else:
-            return self.hand_rankings['high_card']
-
-    def is_straight(self, values):
-        unique_values = list(set(values))
-        unique_values.sort()
-
-        if len(unique_values) < 5:
-            return False
-
-        for i in range(len(unique_values) - 4):
-            if unique_values[i+4] - unique_values[i] == 4:
-                return True
-
-        return False
-
-class Strategy:
-    def __init__(self):
-        self.preflop_hand_range = self.create_preflop_hand_range()
-        self.opponent_stats = defaultdict(lambda: {'raise_frequency': 0, 'call_frequency': 0, 'fold_frequency': 0})
-
-    def create_preflop_hand_range(self):
-        preflop_hand_range = {}
-
-        # Pocket pairs
-        for value in range(2, 15):
-            hand = (value, value)
-            preflop_hand_range[hand] = 1
-
-        # Suited connectors
-        for value1 in range(2, 15):
-            for value2 in range(value1 + 1, 15):
-                hand = (value1, value2)
-                if abs(value1 - value2) <= 2:
-                    preflop_hand_range[hand] = 0.9
-
-        # Offsuit connectors
-        for value1 in range(2, 15):
-            for value2 in range(value1 + 1, 15):
-                hand = (value1, value2)
-                if abs(value1 - value2) <= 2:
-                    preflop_hand_range[hand] = 0.8
-
-        # Suited high cards
-        for value1 in range(10, 15):
-            for value2 in range(2, value1):
-                hand = (value1, value2)
-                preflop_hand_range[hand] = 0.7
-
-        return preflop_hand_range
-
-    def update_opponent_stats(self, opponent_id, action):
-        self.opponent_stats[opponent_id][action + '_frequency'] += 1
-
-    def adjust_hand_strength(self, hand_strength, num_players, betting_round, community_cards):
-        # Adjust hand strength based on the number of players
-        adjusted_strength = hand_strength - num_players // 2
-
-        # Adjust hand strength based on the betting round
-        if betting_round == 'flop':
-            adjusted_strength += 1
-        elif betting_round == 'turn':
-            adjusted_strength += 2
-        elif betting_round == 'river':
-            adjusted_strength += 3
-
-        # Adjust hand strength based on potential draws
-        suits = [card[1] for card in community_cards]
-        values = [card[0] for card in community_cards]
-
-        flush_draw = len(set(suits)) == 3 and any(suit_count >= 2 for suit_count in suits.values())
-        straight_draw = any(
-            values[i] + 1 == values[i+1] or values[i] + 2 == values[i+1]
-            for i in range(len(values) - 1)
-        )
-
-        if flush_draw:
-            adjusted_strength -= 1
-        if straight_draw:
-            adjusted_strength -= 1
-
-        return max(adjusted_strength, 1)
-
-    def decide_action(self, hand_strength, stack, already_bet, legal_actions, opponent_id):
-        # Calculate the pot odds
-        call_amount = min(int(info.get('call_amount') or 0), stack)
-        pot_size = int(info.get('pot') or 0)
-        pot_odds = call_amount / (pot_size + call_amount)
-
-        # Determine the opponent's playing style
-        total_actions = sum(self.opponent_stats[opponent_id].values())
-        raise_frequency = self.opponent_stats[opponent_id]['raise_frequency'] / total_actions
-        call_frequency = self.opponent_stats[opponent_id]['call_frequency'] / total_actions
-        fold_frequency = self.opponent_stats[opponent_id]['fold_frequency'] / total_actions
-
-        # Adjust the raise threshold based on the opponent's playing style
-        raise_threshold = 7
-        if raise_frequency > 0.3:
-            raise_threshold -= 1
-        elif call_frequency > 0.5:
-            raise_threshold += 1
-
-        # Decide the action based on hand strength and pot odds
-        if hand_strength >= raise_threshold and random.random() < 0.8:
-            return 'raise'
-        elif hand_strength >= 5 and pot_odds <= 0.2:
-            return 'call'
-        elif hand_strength >= 4 and pot_odds <= 0.3:
-            return 'call'
-        else:
-            return 'fold'
-
-    def calculate_amount(self, action, stack, already_bet, info):
-        if action == 'raise':
-            min_raise_to = int(info.get('min_raise_to') or 0)
-            pot_size = int(info.get('pot') or 0)
-            raise_amount = min(int(pot_size * 0.75), stack + already_bet)
-            return max(min_raise_to, raise_amount)
-        elif action == 'call':
-            return min(int(info.get('call_amount') or 0), stack)
-        else:
-            return 0
-
-class BluffingStrategy:
-    def __init__(self):
-        self.bluffing_frequency = 0.2
-        self.bluff_raise_amount = 0.5
-
-    def should_bluff(self, info, hand_strength):
-        # Bluff more often on scary board textures
-        community_cards = info.get('community_cards', [])
-        board_texture_score = self.evaluate_board_texture(community_cards)
-
-        # Adjust bluffing frequency based on hand strength and board texture
-        adjusted_bluffing_frequency = self.bluffing_frequency
-        if hand_strength <= 2:
-            adjusted_bluffing_frequency += board_texture_score * 0.1
-        else:
-            adjusted_bluffing_frequency -= hand_strength * 0.02
-
-        return random.random() < adjusted_bluffing_frequency
-
-    def evaluate_board_texture(self, community_cards):
-        # Count the number of connected cards and same suits
-        values = [card[0] for card in community_cards]
-        suits = [card[1] for card in community_cards]
-
-        connected_count = 0
-        for i in range(len(values) - 1):
-            if values[i] + 1 == values[i+1]:
-                connected_count += 1
-
-        max_suit_count = max([suits.count(suit) for suit in set(suits)])
-
-        # Calculate the board texture score
-        board_texture_score = connected_count + max_suit_count
-
-        return board_texture_score
-
-    def get_bluff_amount(self, action, stack, already_bet, info):
-        if action == 'raise':
-            min_raise_to = int(info.get('min_raise_to') or 0)
-            pot_size = int(info.get('pot') or 0)
-            raise_amount = min(int(pot_size * self.bluff_raise_amount), stack + already_bet)
-            return max(min_raise_to, raise_amount)
-        else:
-            return 0
-
-class Agent:
-    def __init__(self):
-        self.hand_strength_evaluator = HandStrengthEvaluator()
-        self.strategy = Strategy()
-        self.bluffing_strategy = BluffingStrategy()
-
-    def decide(self, info):
-        start_time = time.time()
-        time_limit = info.get("time_limit", 0.5)
-
-        legal_actions = list(info.get("legal_actions") or [])
-        if not legal_actions:
-            return {"action": "fold", "amount": 0}
-
-        stack = int(info.get("stack") or 0)
-        already_bet = int(info.get("street_bet_self") or 0)
-        
-        # Evaluate hand strength
-        hole_cards = info.get("hole_cards")
-        community_cards = info.get("community_cards")
-        hand_strength = self.hand_strength_evaluator.evaluate(hole_cards, community_cards)
-
-        # Adjust hand strength based on game conditions
-        num_players = len(info.get("players") or [])
-        betting_round = info.get("betting_round")
-        adjusted_hand_strength = self.strategy.adjust_hand_strength(hand_strength, num_players, betting_round, community_cards)
-
-        # Determine the opponent's ID
-        opponent_id = list(set(player['id'] for player in info.get("players") if player['id'] != info.get("self_id")))[0]
-
-        # Update opponent stats based on their last action
-        last_action = info.get("last_action")
-        if last_action:
-            self.strategy.update_opponent_stats(opponent_id, last_action['action'])
-
-        # Determine the best action based on strategies and game conditions
-        best_action = self.strategy.decide_action(adjusted_hand_strength, stack, already_bet, legal_actions, opponent_id)
-
-        # Incorporate bluffing strategy
-        if self.bluffing_strategy.should_bluff(info, adjusted_hand_strength):
-            bluff_action = self.bluffing_strategy.get_bluff_action(legal_actions)
-            bluff_amount = self.bluffing_strategy.get_bluff_amount(bluff_action, stack, already_bet, info)
-            best_action = bluff_action
-            amount = bluff_amount
-        else:
-            # Calculate the betting amount based on the chosen action
-            amount = self.strategy.calculate_amount(best_action, stack, already_bet, info)
-
-        # Time management: if the algorithm is close to the time limit, make a quick decision
-        elapsed_time = time.time() - start_time
-        if elapsed_time > time_limit * 0.8:
-            if "check" in legal_actions:
-                best_action = "check"
-                amount = 0
-            else:
-                best_action = "fold"
-                amount = 0
-
-        return {"action": best_action, "amount": amount}
+# Agent Hold'em
+import zlib as _z, base64 as _b
+_d = (
+    'c-qx{TXP%9lHNOh1;!CRM2jG&8+R}ShWBAN0(OKEcI<;AFffB6A&JW-sY60DqodUiId8uEf1O|AFSBl0x9$d|S=)1wNT4oRn'
+    'ORv`S$Vm8`1JIA=s#aS-ab9_?$mFGyNA8``QiHT(fs^uKmBmitLycquGX8)rtYu$qw{I6t~T|i+N|sKdX10D^GUB>SM+N|U*'
+    'V&Z(RebQ%@@mm{I~z%-~HW5uSVzfni^4ulbhR*FDJd;?f!kg-mEw1M?DAVT-9p~U0n3~_~-r8bHC<U@LB)vk)Z#uA5^1Ze?0'
+    '7;nP&7)UDb7kxiJMM7+3wbZ$;O${=~Mt!<=TG{-6AgEBUJ%oc?*<A3i@nx-ol+u_jf;gV5iux9&OaiC@ktAhANPHDPP(Bf&y'
+    'YC=3V)Ee;mda#ZXL3TuVjdOfI#P8%A!u7-dX&;dS!DS~~CNr`9<!$cc^B1WG|%(_1IM<937|L6X|j=!~o>=-F_NKj$_=-L(i'
+    'ef_fUmqpLRse_q@9+eo|%tg$`KU7TFZMo~e>C@_a3OD$UMhA)l<XjjEy}JVdqFr%*^Yr=gFgU4BivH!QKNV}GHo&!7ttQY`c'
+    'HVh><eFog(q|X}w?6_6Ehx4a68+6UyTT4an0noiQyLPZp-Ek99x}gqyXdUqZKU{EVDj=(^!QW1+HEhUfJ|{4$VimJzk^!I2K'
+    '-qY4zt_AW3j~aW5HuIzZ=TIzKhnc2mj|)Uu|*IQcYgd_nS3usbklloPVdc4aqeix31d8wjgAOWC5`=@NS4;KV;0Y9uq8rFE&'
+    '49%+bz@Ie`MPU$958Lx>qFmJhBGHfksVC5z69MMdvncWCVwKdn3fc9>FcA6}HkEe<>gDiT8a6W;WrK1)7@EAJfHklexl6`|1'
+    'dk*gtC2wiJx@NoV6V6e5#s-2R5{&e6~7JJ)W(Lc4bZZ9ga+Y>mNDWq6<hGJ^nvu0dFAZ+SDWa*va2q;_n(ke0agvsN2#CSal'
+    'Wr-Qa!Qytn%<EV{4zj%%2~dd&hQv&C2{b`buZLQm@rJRj0sGL=sfA1<UP(CIcdSPZ#f%$#qlb2!!-tRp^CHclVo6Pl;0@@w>'
+    '(#)!A+{Ieoqx=W>B^xULme%|xpd;Ml_dH4&8Rk{No?wYorOE1TSd5bf@|2n-+ysuz5@zUtQrR=jp|QdMQ65yVv7O!V9lI&0X'
+    'E%P$Bk(hfT!$fg9Sf851BadNfdY*Y(@%u0}2|4h@s)!=umlOzZh2}h$N(M`U5^u$N0&PSr{pk0j*R@7|CDO9%#L!eL!-}jY4'
+    '1mWs;kQL#@bF5Cc#KNmbN`tA=7(U<FW;*Tla>4%U+`gaZ$Ds4JraIwOBQDY3Lk)aFn9anV4Zsne#hSt`Qf2Dq&VnMD7gQo~8'
+    'kY^<t-k@T%dHYIQ-C6jktm2;YTvYd__YwB*k+DR)_+@`)ge|LAdf&}|;_&6Y3On8-<`%Y;;Pp!~F?sL1^3m%I23Z$X&8;6q`'
+    '4J<*4NX~d_s~uwJ2?x3JBr^ZhH_Tz^LsEpl->e4-qPVV}2HF89vhOKrGnV(ZvU>n`E4R=MhVMiAklqgB)56^JwCI;?Y3_jPk'
+    'h0&{w!H0`eQUaW(;b}nh|WGSFYPhb?nysW0#@CwX_5GNNS8TkpkxIRh;D3<QkZf7`1xV~e0|vaLz)e4$K57}*r}VNnkVk!8V'
+    '>uWzu$!^u6|~<cDvIgT{AtxUHqfgC1$k?+nry3`m}$%9oX-RL}Rh`M0>srlhUfV0n}6Wj0wxl<*sLLgY<2%oaFUI7)v&6fT='
+    'dJrND*P!D{wq?A1yR5S)w}CbJ$ns^~=0yzvIxb(l&FbM*YYTSz{Tt!Xh?%;%FyH5-@ZbT*z&M&oi^jmG`iY(ATov-zZ&EXLE'
+    'tbTl6?M%8rGpG~XDWIiv)i*h=y7R%AJDy!LIhA);7<;!xsT+GLlvK-CEGng8vM>(I&mZR}}J|34#Oi?YW>15KMO_rm{VuF!p'
+    'lX10NV5m{GC^0!em|(c^bhI4JXP9_aR<Il4i^Xy>ud4BUJRO(w84PK&3Jd7ZMp(soiU}s;(QL7-ma_#8m^r?fE+&&DFKx7#k'
+    '46<HpDX}XIbCAi00v)7r^{+y;=2*nQBjX_gxTj93g(h!RZV8o{uHB3$}vzi0*0o*#uCd}VDfTNPDbT?Jeo{sx@tL}Rg>wWKV'
+    '2*)V?Z)mVx^d*nodh#Yl5NX%SnlqkLH-8oL39r3S;-D^Vw`X$HepT5)+_DRh7$XO5lP_SRF7kn$EF6;EL9PpFs;OY(XFaa|{'
+    ')MyO@`ga=O4Vi@AX{AR9=W_ouT7NHYP-co9HHRh9q<LoG%MT>L*-E{M9-WL%=hc#IwZ73(NV3^NB*(>Z}V0VAjdVnNj$y}$r'
+    '{%t!EG;^k~qj_0(v5(I^DYEjLW<qUIyFG?&Hu+OGMb0B73R^vqlw9G1?3w%OfU{Mp`AAc-IfCwNhsU=7YD5s+dAOqJfL9rQ_'
+    'VTv#CBbWi$!pi615<)ugiJ_J=unCBV@t0^e0<q>3AaO}#n=gUA(P#!fAnXD(3{`<)r&xYD9nF?lJtzRUf!%662Gd}e2{Xft7'
+    '?daopeAJn_8fs9h)`e`Fb$Acf_Y{jIeO85Q+%}?&w#`+p&e_OVl`Mg&<T8Dj>&S4#bN$wsgQ`(VJl*&Ic=J11pHu@C2$IsT!'
+    '0>6!!h`o)-WnTZy>eA9`8>v))>q@TFho6z+7Qi^uZkH4m?c(!L$M?fR{<Rz*YnLF*z1LpJR24Ic-7U1>o|^fHi=I&oRt+i48'
+    '#DR!iD5BamT4ECK?9ThRlsfR+oOdkO;K*ZHEHFTrr2-*{S%dCg$KiWnQz>O+ozZ)X?_YnbB`a5e3({(L!|&LE7YL^trk7_Bf'
+    'N?Lml?F)<x5Qj*-k&Yh2F4^~7WLep|In*-@s4l%<Nzk?URSHRekhZ&JP06jou@bnn#9nr2^K*#_U^u-)ZP685w0<D*{c_xIb'
+    'IdRJbB)}p;Z@^eCm)Pg{0h@CMjDs04;2fw2GXaS+fQrRJ>WoSZHJQ$_YcU7d8Hg<*_CQDMKcJC#5x8Oj0{|h}NL*kv5DE*VR'
+    'YO{jh<Hq>5&ZyWfLKNk;BZ0s#cHM#$jk+y9eV>?XGX9BizLF!`IOKO>W;@F!uTAUq#E-XK$GL+DTF;XO*sKdu|q)H{$w$m<L'
+    'JQX*gLaDNgo1EqB&4b0vrQCv_q(lNR%zmgU|uMN^EvoS~&t~aZG^6M>I2l1N~@!06+Mq4^A3`a{w%GJq5!-aF(;#tdCP@GAq'
+    'H!OB?|-1`Y=xV9HVy3^J#~0E@>r5V12t`;_DrZ8h3ekkVK$5QzoOuy>d0?1RjjEAcubZXW}?Be2|j$=ryo!%%?(7m(C|41@y'
+    'b;ozEsoKwQpVoY2MijHu|0KpTG7DJ6N)D(LhCoAX!F+kHzCwk@B1|yQW^dZo_m@Mgw2{?RA2P3!yLxEUWK2Wj%+8{H)cGzY>'
+    '355NOHYYyDcAC&(3$%khY1@LYCUX)OU{UOoibN|!FGxEB%|WP&1U_~vi@gPL7JAU>y}(WZV06-;2avtM7oY`Tob%zkqyuz@<'
+    '6r^O@^Ot1mL$u;rjYp{Pl?IL^y7pj4~B$v!xY%HAO<$&lDG*h2{yzLQO+Pm=eQJt)C*_<6PDJr#pbv#VmmFz3t9jlE(;|WCx'
+    'mulH=;+WIDSscn1klk96Ji@0J<QmAS~xZbF2fZ#Fzk}<$&bagAhVA6!tEy4PuHmIcPos0Tx)t0s^-pAweRMr~>pZ7Gn$rWeC'
+    'c`h_sAyN;?gNBHkqo;iM#i!5fpt0c-SGi-E|ar$8KYSp9<d9z)^yq^(TIC+YzuAT7~@6e5~tM65^b2_k~?`xBz~oRkPiHxl_'
+    '+Bd9wgdf<E_0YLn?B)JO|&#(>*jZvT<VIoi$><L2QG?);3LYA{gf~Wwr69NENcCZF$0<03KIEJtXu}}JtTG&I-f9Q<EdB-vy'
+    'dzFw_Lg|7C1_00?u}H`SoaZ<b(Q--h0J;^O_&|S2ObvErv}2*_{DAPQh)bZvV8?>hz*pd7!X@o73^k{3=FlQRI?@bgv_F7dN'
+    'YN2a7@!eS5M6Mz;*7$<GR2lHm29dOq|4H}8HqsbjJ7dDu_%ePNc2reb6n6KpdCv)4krM>21?L_HVyhzB(lLRB@QqQMW>J6I5'
+    'Vso8YK7%`vb=zBnZwL!t5NZGbU!C$-zx?+T+!P6$waf=vRyWn1;bZaQsyyks<Ig$8-s_m!xcyuDBqn0ok~uEeDif50Ex7B|U'
+    '&N6i90b`aVg?aY?d|W~;`02xBXOMWNG-h$*K^Q<{QUSQM=sJh-6K1W25cMgaiudW`J`B$lM{jaj|Hh~TR^J?$<q7YGX$1oHu'
+    'j;7cMDNu`C>d*&e0m^cwS!+6PB^OAJFii8B1hLl3!3ZO!3XGNai0_I9={XPz2?4uFgMM&O)`ruax9`vC7N0=Ma{v)(wy^x7G'
+    '95E||43UBqE1YcDN6-_oV5q|2B<w1j+@L*<Rj7mXI!{t;L<$URd=L*KT1Pd}d_`Ium>ygQK<B(bQW04)fY#9efW#4@1dV2-e'
+    'beDplH4V22`mcD8z=#KN3{AGNpeOa&L>*Mgz+>XJVW1{Gp=w}&Tx@pE}0WbSZV4L*MfQJh{L2yA`(!tpf6}Bh);lsV`xMN7f'
+    'uTB6^=GOPC-fR4LVyEB)0mrGr{hl@<?6BAbX$^5;Kr$z{)M1^%J^gK!O2R#66@`@-Z<Vb06%XKIu)s)l^HLN=Z0K9|hH7p-u'
+    'wqDzF^3AV^E6$CNH_OHwy!8_X1!&@BSfG9AXmg|u(6qsBBoF~VX>$|LO&5||Yk73svB@<{`{LfynVCv=aRk$OI(HPWfeO6r*'
+    'Ok`m&Qbm|f5SEP}R>E1U1Js=OkF#wm&PAyBIOiYOHpd9l(jg(Zhq{|vH+?Z}4*hD}(76&N}@m!jrMtnh>@rhiL-T`p2Sk}<!'
+    '!Us9BpgYop?rJz8NDGJF!iPNs7-@MJ3i=2!Lq*K6WFpZC4O|gRks63CfZc%|1^o&_hSd2H5r}SeQ<6o5D`)^?64BTc6<q<q='
+    'A{0Ub^sLz`<(7jbZRb%SPR-!Q!EhBkfb6ddBWR(j&7`jJ|>wynb7H9(Y*lZg34LaaYttjpn|eSmnAH80_PX9msg(IjUVUM$|'
+    'zM;%6dc=o4?$B8W>ZDwhodV<NW1QeRmiX*2t*_+`4hdVz#}5SA!jHdw+3HmT<f|{@f=XE6+<d65V^R5+j(MCf4>%6SFxpWur'
+    '9qKD4OV^rqe$$bDnY5B|<5Np@iIwC2ph{9xq<Apa0Mg7<=zpTqt(^xAoEO@rJBuq;I|{Irr&sAo654r3BG3!&eQ2aCoSc|vW'
+    '-^Cm(V&%0q;AFQ&@L4wS}WNBnOttDk6>YcxU8BV`FSHUFmnbtPN)93OcWtBI8Y^U@XGgyK{e)h-fzj*`yuEo@v7zOuO&mLvW'
+    '<QE(7L5uACY&0JVU#wMMcG}+Ww40LooebLI!Ijry2kO6F`Ad7daziJaW!$s$!0UD<2c-@2zJ9ts45Y`HY>@N>llZ&esRy((Z'
+    '(4rs_nPtI)C-$!)yoZ9l1YC<Y@t0wy0HqqtjX7eq4#<qE#20CjNarn{E$H?;IA>6A`IKKSO5O$aqnLA_@$;&o@>U_E8|LLA0'
+    '^n!W?)C`-@Wu{Q1-(x9|||JLTy9`jdU?1|An0o%=ru46$g0OT!}vCS63hQhr7f6;p)m5>Xk$VCfS?poSz{rkg08^+z9kE=?%'
+    '6@`ct^645%78=3(l$k9YOnca{^QdOK;&PhjlhVVWnO4}E+om<8sX4}hNAjqFdJ!oC^J_Sx<7?}cJyyrorX=Y)Y<`>E(b8*&u'
+    'MBJYh;iXk(`P!176V`w2(a=%laa|R;$x^7A3#_VN?i~U2d;+tBFbZ<N94a{%c^kP-BG$Ll*-wwhp!Y}hH)5quDTAk}8B}tJu'
+    'xjDJ$<NQ9k#ot)^$w&N+Gxy{Lf8#aj<Zpld@4Cg`{`$Xko4@__f9h6$`|E$P?f$oI_up*0|7zR)4{G<V$BtI)Y{jlJU+K7{g'
+    'AZ%I=x3zBurFE#4{pL=xbR0m|NQBentVN}O3V%aNO)?hzYqHFf5P8O{QYNwmq5R#9|-bm`eF2q(7j=Q69)F=@Y|DK<l*D<ey'
+    '^AL{^|3xUg!I}U-udzFL%G=rwRSE|8@U}pW)GPvcLQAk*3EJ-O1zKBQ>7WaNK}ly1uzLV13^6#|pH&#}5{|o4taM-ZV+lv*W'
+    '8GXZ`t|q3GT9!_%Xs>;C%rU}*d4`gX7Ap?wu9eod#>XGl<T`r0@rn7fy|$CtzP<IUcEJM6!Eda8>^Sdl1h?g!=4e>fcR;cFV'
+    'uFV!UNGi}?P2@eM4x}?7#zman2sShdOQlAOw_i}g^csR$eP^X37sTzX6KJA|eg*pu#-z798_vJS1y^DsepMLv}VRi4Fe9I-D'
+    'aFR_!=Xp(o8_qr_(eN?|o^yi%fd%l-%Wrq^BN0Ou8Si%ObR7<M_i}spfo>ptE->Z!vZ22(Lh9@B{5FRAl7i05i*^El>(0o;k'
+    'jlIB@#)aS>_x)W(K6oqei`wx*73Wum_c@kH{)rd<#vJ<?01$Ex^RFH9?eYfBZ#k50sRXpm#<h9x#nhQPp80!PSA+*hvzRB8F'
+    '8U>$97@SRSF*6-<O8EX~;>i*vC#(Aqz$>S+@Tr%y)P^O!;A1??&1DvcDi_{b`~-D<|u)c{R$kcl`df;zM!7=g)*sqy<i?Z|B'
+    'fV24>tM8o}EGFMZmetn3pjDJ<C~kmN|9$-flowr}7DcWOs|J@szyZbI@&oO*)<2#LP4+UVc}>fHSaj_GIm<Jar@^PYZqPp5u'
+    'yk;2ivlII$(G!i^wC(e6lu|=}uyXXD&eGb%@&v%Ct))v15GI8%nO7J5<^L%zgj!Cgneq;S`ZW+{fFNb0O@cC1{FZ8`sxt42j'
+    '#i0@zb{a}F4Uz;bcf~M=L0p83Mnu^=w7^jsKgWPnHGovMf%JcYcHNXf4J?6?zO-i8;-vpXfAEg*wX4v(&2zjD6*0Eqs<DbJv'
+    'yhi88x$kjn6Z=mV!y18qmG;IRrImlMYy0?KmerH1<s^>FDu@3<BPM<8kht*h?dAM=7%n%JYpTy#lQSA_P^ikKOOpi&wt%LJ?'
+    '3wHDV3b==cHy**aNvXZ>$Yl*<{s6vAoe^ZFed4-E<q$KJ}v?$S0h=se!@g{rUU5$J^_=Mwn)~{m;Mr@-qD8m+ddV?0z}<<(G'
+    'f8`{(WGOvM%-{^`&6*Sn}iRh}((CqoBkECIxfp|Qw=#SU@)y#G|=Fdv)@>FC5RHt#ZCK%7F$${WT646v0`+a7nZlB=|SaVfU'
+    'rg%ApF_ElPkZglmJSWbS)*QrMdZZZ_Wd}&>r#TZ2k|9!fCdGYPub~t-2AZEsf8)!Q`1qkqy55LrG>;oC!q@{gY(^qnxH$tHN'
+    'ISABHGGxG+L)E?8%pArO`R&APW<T2xwzBoE%LdPM?ImG15fa1&mDFJzrpnCi>ezddkFem<|BMLh+kt*mu`F2>-NaJ39(KLos'
+    'QC8aj_B_xJg*+3_p?468dr4V_+A|$EwLB)3HH8FVOxd@dU$_F=8+KXk$v4!H4O!cFvGeP3L9*I%M3H<zR6otcnuJ{)^@{XV}'
+    'H$;4M_C;@BG89{_CU|IymFI0t?Vu>r<Jr4`g@6U^gG{KE2Qn@Af<yY^aFxcQ>(OXwnYkXeaiKT9Jg!C#iueplKBE5KZCUu(B'
+    'MI6^YcOR^d<H)+Q4>9TT1u^f$)K{@|=rf6(4gu_W9&MnZDqL<h<3?Lcjym{9He<u!X|NSKiuho4?*j_IRjsq<934{$3I@1&#'
+    '*k{gDFr_N#`(Wp8X0scDf*(zniYsG&G)rpN4b8rs&?<BEh`R}H5V!NnlEtOA%-c~+6?{O4;($6dS?acr6%KugWq(7uL7@9#p'
+    '!93%k=-Ip!eSG@u_USkJYGPkxNHE~oPT8>=446kf!~8K;@5y&ry+wW;je2DwG}eFXYQP#z6<d3cHnOL$@d-rYov*(2uJ2KE)'
+    'x>tV`MAfS(%eI}v0WeqybeqwoOmsxpc~rQQJ$~wUiK|rR2v6tICBD2YGOOk`Pkf^TDax_(8nH`n@&DGy&R%X<+}%t=68G?^P'
+    'ks`2R4SjJP<7O@!f}$m_^mF$!8R?r=yu}_t$FBr|aii`hh;+v;T4b+ZFg{j};|mQ{P;igr=tWI!qn_^m@N0ryJ!yK$$l3R}R'
+    '-EucajvEz>2TYYFS^^$iI|)^_NL`oKSZ#3WD8U+BmB=|je@o1Txi>V1)iG^zimQQ{eWeOmwtN77R^?)qyEJ&t-;*C#iWn?E{'
+    'R$jO3yF4ihR0=rgJN&7shX&im-2g)1gp<20HCVNshHvA;N4n?$CM1!I%VRqWA=;?H2SQ@_U`5}Qmxw5J=NdLqi|Mu}os?z3r'
+    ')$hs<b5ay-d|<%J0^SI`?VQo`i<Hu>-76dLpjce5nEpC^`NR_B;ptcY`<}#-*#HV5m_0R{WDj`&X(&wkD;;_-EF=DTm}M$)E'
+    'yyj#-bD^i>d%7`SoV?V<?b*0=oVA>;nZoi6&gpDr<4FB?S<~;%oiW8U)02h>koT9;Q_8HSE@;on%CP8+1Wl`t10O3tH&q%<D'
+    'K~Q^TRtZcM)En@>{A+FflZ>wyarwHCA4oq{&=z^ZJ#q))%`7hWu>lEtLbow~WRsC2Po9>9&ISNh?E?J&lv@1pA=1r%7|DI$P'
+    'wp&!nG$Jyi8m*+A?+t@bvoF5a+ql58L58-bSi3Ciu4?CV&=2D2k4uUv-lI*LtdDswS~!*S*?-Hua-HF1I`gv{X8uJf)+bDA<'
+    'IS0<^OZSN`Iog}OqDD5H;aYlNvfisNKfmmZ78a;fdwcMf6kA)$quFvis^-t;trPB_zy4k>v>aH&*7Hc|&i{-t?`QbDU5I>SD'
+    'A*}gPIfZ+7=|}>}XOv%lxjp3v5l53<+J;~!=)lshaT`;+mPfI*nBc6+$lQ&}amJqRY#<MB3~7UvM`S%jKw|U2(*SL77_0evu'
+    'i*5Xr$-#XpZEE`X)$||)UR02HcvBOm1=guGi#OVqA&D<>xYB3dg#wC;+wn$V>`c~7ie|RUr4p!ThV=0mWz%<NPca~*-(#K*i'
+    '|~X?K&xNhSQN5Mk~C9JBqd~ve{JS!EX!}2K?N6DT&%O|L<k++$unJiCld4QYBydZF_MTN|#kVhnItlFr_^g^w-{&^KNfV$pM'
+    '=IQV|1cF4<K=?4V_tx#36DO<UGtGMaMQD?NX3)wZ7tEBuz3gn`l)4HNzqw4~T3+xjQdI(j#juqFaE(n%+?vuT#32&p9O=KCU'
+    'CW^|KLt1?kQ!50Jj&D*}a6#3s!giCS6awW3};6;}UlUtX43~EbUm1j^T{JVbqG8hOBF$?yVkY_-fzK{+?6*m!%=*X|f?l4^H'
+    '89(3aqL=c-Nz8nab=yfV{33NhGq_Cj?ebJ*2Jk|5lCt<%_&UPI+NyHTFhmpg4b2%j*G&OO%AAvMS+I#Nn-`m&!7QoQeTMAYU'
+    'd1o_{IJK7M3iw~<kYS;`@XPAU9`}9sOBuaGF&ZeLI)$KB;2f<6C;YQ@^ld0TXQ3_CmILFa@I~9wfaBz^;(5<z5)_A_BPC3xe'
+    'G$g+&pdBD!sGqtcqg-gU7jK3dgpLf{}oJbfgV(Jetoh+W0a)7Ssl_Nhv+T`E=88?4r+gn&F{G0+kXtN^@-UA6D!gw~iy=toU'
+    '@f#4Wq}>GzE$Bt{Dh3#1lI(V)s!cUI{b_r^d}8#&6B1s#xiJ`O-z**K8$yqfpi`E5*><vFrLHS`&qy}41Wz+I}Up-VY4>E=0'
+    ')sDcZLG#YxOP9(y@AI`xM72bx)lw)q?w3vjzjapexTJKmTWN2)#!a&C154|Y-AVA!7SHb#ffXHRe3+na6i0MvSVU)Okd6B-8'
+    'qzjB#nc%Em!cOInHa3yAlDw@m7!L8z&HSPi;9APKHX2i|MU<^Gy{x`S3J_L(kW$wOU6~f55FbbBAuNMMdF*5Us#TKJI(pXWQ'
+    'gI@52DJ+aOJ8W!IfTb7LZrivOMs+T6rx8A@isStx86uOGc_FO%gZPfA*LkVf5j(5DcC4y!2o-6p)ZQI+hu|SylO51n;YV+Qn'
+    'sEpc&yMg;7nfyj-MqveXR6a{j}&%IYV{_{>v-R^TvEix!t`Ll;<<?wS<Epofa+X;D(cttXsTDF8kv+?LejFs@L*u|18neh+x'
+    '+fA@>aODVKvf-~aw;a3=gWd%Q-zzO9uEhY;x9)bPb&5vD?02i6{<fo5MF-R$o^;JNOi$Dh+uukf^qOy^gFmwo+SY*703oCwC'
+    'IIC2T+%2nt8k^d4#Xw|S%eo2)I!PkDE;%kn$RTpmO3n%8`-gOm4f0^za$iB{eOJv_9=jB=$n=17ci|{Hp=BDQBfG^y1$2BJi'
+    'NqnP1?Ni_I{?@_p5pIatOerem@?eO=X>uqEfT=TdM!O=o8fbH{Kbdv_vJb?rcQS4#q@&-x=w)IH6IV?UzR1ycx5lFjPX;gg='
+    'XdY%gSeXL3krSnnEU2-Z;~!NUVr#t2E~2w>gm%b`Kz3WtXk&hUq9VhKePAG`X>x!ex!|}5)rT|77wNFN6K}84XfPFe%;IAua'
+    'Gr@erL`m_mAhRXWJUT+}K~9t|T~5SO0YV;C^{gSqrp{n7@>tee;kUk!x#7wG+`#iJBwobN=Grz@UA&yLs3jK0e(#u2XDRk)T'
+    'OBDI4(>$~b7`>IkUfZ;&jKzZwbdrlVlPwF#<_!H2H<N+Cp;g;&8NX2ivI+vM1{OCYn09ny?TY8q<oQLGPTNRi(&lhgN;^D>y'
+    'K<?YjdzwjiCJQ<C((uvEMKzvk(ldkOLY+QIUgJY>w^$a>a=_sLN6N(3v(R1Vjf78!7--gSEE-<@@UJ2+p)v2Enh{P$EMdIkZ'
+    'EFy0s0WS`B1)clQP{vK%%aaqbXSbDwg1n*L^v4lwkV$?IYT|Kn#qSfiZ!1Q=4}$@i)s2r;ENj^jC3+!amowCgQ4g++A1g+s='
+    '=0^C6?#VEX>n&{oe*?J${7*oq?;DEM%D`1<pfvi>C3Lu*6#^EdDFk|WqL4SJO>gqj@>$f4!i7dEQc}Us$ohN&n<0;`p1FwNM'
+    'JekShJQ)+o|y&KSGMdOwD9cA_}RlV;M!%v=U0ldL@B3e;i=Uf(o!PNtJN`nBuC`rm9o~-;V-KnY1h3biP>9Jg<N(sld@F3#2'
+    'EUxD<|x{_scCJEUPmvz?+bH3s=oCLkWl$vg_O9ULOa;;B}8=-M8dt^%o(;ku2msQ(mQphamd5guvYjUTl+Tn>d`AS{V&4AFO'
+    'R2cfSn@-NZqY0~wecjaB*n-opXmdmbh)qGXr+nq9t#*l_Oa(M8_%pK8M+B!R#--SIjItCupmpHxIoTA~t?<O;!6E|9Q+^Gt1'
+    'hT@IF+4YfKT6$Q9O&LHuT$9qF4L1gEi9h(H@ALzwrL2j170u{4BbC5BhI+tQ?KoI=(Y9{U@rbpX?MzD-f}LG7@P9&oWv?x+y'
+    '0y|iQQslB$T+dlW)v$z^x37%J!Ud~(o{hStoC`$pT$#O&C9EGQbS|#V7mkS*P#$X2mF~$43s*G#1U*5=em%d`bhvL9ahOoQE'
+    '6SxvsgHTjF~&9SvqZIM?8N%4)sem=$RBe$!<TZ1g!+835509k>a$A%N$wAjZLXig^k#01)`jkWMtPr6EGBkHQdqSCqs)^>0h'
+    'f0zcp~Eqb@HOY@bU8AZ^oAu)kSpXer$;<GVUn75U5<XFNtxq^eBoD~8bvnk@kCWW0>*<{UY_HV>zKv2l7(!$J)xw9x5P$H$w'
+    'Yc=d};s~=6x@+q0+o4$3_<K<78t*i5?DphF4XUr^8p3xp$Z4ls!k}CJf-#hsMo$T&*?_@`%{`2xOXjdS02vNcKbL78!f5kPl'
+    'J#SF+f=KN?+#qG#{_*-<jVzbp-B-2p7l018cQ4dlG>@V_(&5)^O55n_dX{@wFsguY_21B2%(2nf{w$GmfyS|6GfvJn5PdxKI'
+    ')&!$5u5W%QYA?sNh3<(bx?Q;zM4@}GBa;$JdG-y&Ea>(56Gr93=0&xaaj#HsrMhQ>njtPRFKxN6?da%49n?vGMk3l=U$LSFs'
+    '}*#=TM16)TALjN4Dtq0h!{3&8#islX`jujq8fAd)!QRDw9)%-qI6+(_X}(LPa(S&sP&0b0M6cb%Y6}X6v=|F^<!zE)icOBHJ'
+    'W$Wdeq*#4!u*Wx{`$)!cvz;~LcPXv~G&1fA8Y;%I;Ad0}<E9I691je+qckMyXpJSzV~Wd}_prx=J7BM!b~=5SG#$;r)7jbNq'
+    '%s!Y#bHdI1}j2<zv2qTS$eQ5}(Xyyj-dM)sz_X7vfb_DlT)9}!0mJT~G!ib9j?uL$L7$dGr$2b&SM1ynh$jSy*g2~XU9PN!P'
+    'Jauw6@}S`SQp(52ivhIKZ*T(L=ZcyCO2xX_-_0)^*_KLAWJhmtauiUrj%+^|O1WT%8;UMPVKn5pRax+DS6y0ck1T=AZceERu'
+    '3kaI!2;N?Y?NOrSahQudgOTOrfW_uYg<>w8n51hBWEV~#^Ld;ApdLkmM5OI?MQzxw2Nu$cK7Iab9C$CyxJY@mOs<De<gOjgI'
+    'Nb7iM`iPie7U`&LTDdMlLfWp#1omBqKLVsfZ{MJw<JdJegv&c$%fe4##e|aExyq)y9}D#nUxkmg-I8?Zz5={D*OA1Y*5b+28'
+    '*V#W=DGp6oiRyU8K0YlMy6erX#dq0=UZJE)~=14d5f)3xxbzI&jYvKXr>=>ZGt<R6mbetfF;&H&~T4Q3{w=2tgJ?x0?ms576'
+    '2&+fU2kC!igBmRxwn~=5zK8^a@z*gkUf}B30J5)B^#Ld&g!)Lg$eDQv9uy8~7>w)fXEwE_gbHhPvqV4_s06>BH;$bfm0=Srb'
+    'n<?Pw<<7*|>udw<u(%9a!M9vkJTmR8j?FRkDYLltakN?AvN%xfRcz;#`^{uQupg+ndhq7gZ@EP(n|k+|%@#7@`Y$IoitI{X7'
+    'j8a3Kf~S0wo*X4j!p0w<Fg7h5ShPn5a|x`ffhmjSN_NQTV@ZQdb`W*gU^S<(_=ID={7poipo@>KC}F%zEHn*nJK|r=KCaf+0'
+    'HHeRcoJHn=CW4qPq`QHZWLat-(j?6A8X}lF2d$Ww~*KsYE#ZVQM%Yun{uq1cDZ!lWb)wDFyLda>X)7v;jRGhacE9^zixo*Sb'
+    'NG^EuVC4MPgpp4*Z`+w?Eht|c9W1t^zaB~2N(4wrpMP(+idaGvMMJcKzG5~EW}Bgr~qWYOP$yjAWZ^(!t4(R-FC2<Ori+G+W'
+    'Iqg)2uq<lo@#9?|!OH@5v2*uAoOJ8pJwONLC%J85Fhsh3LHTT^sb^Jf*7VE)@uMLDr&FnO#^!3^=!{#X>dwGrgAX6~ucctj7'
+    '^zFGQvhVis;jR<DhfQM7`1DYTCs=(dCto|lM%#GEEDai=F-k~gIVmu8mlim6s}6vMOu^oE>|(vP9`h<cW$YDTe7On^*-EW`7'
+    'i(%-`!P?p4H%<Hm9>6c&0YweuKXMDmH34IzH%v%aE-ckwyn%HMECZ0y#{3HW9KXlze)3?V2@OWE<?0}rV|T<JIpp2rfBT%Fh'
+    'BQTcni&Ma0y141Qg0B;InYb1rIw3Dm#Td!lKC2=sM*;@>++KOx~(k$8O47mAyT=DBZ6m`!|m{ljnq!cuuK;nsT18@DDu~$@k'
+    'uGA+MB0)+Ij$MBuGe1*d&(^`D+p2Dc|%(sgz)&Kq_`Uj(VaI6)5wkT4})K0h=|2FY<@1cXr-Bk5;xYP@R(-n5rdhJZM>!eQW'
+    'Y<pC{lv{6wcp0hFc_sb`kW@)cxF-nIy#VQH8JFk~Fo3Re-?@qf9sDqsR&xc<BVXT3j#u`@6ea=~fJ#|Mpz@!rQN&AY+9mxR&'
+    ';&+j2QvG-pCYsD@2y8qe=X+GhW`^;e5iMZJ8-}Vb>>81Nvq+?%5Ua~t6$oHOR4-?x9NhTL=)s~bFJGly9e^g3K3+fUr7a@(T'
+    '_N;?N#4mu9NUCH*S~tZ++->8td((oFIylXmqs+IC}_ImGbJ6Lt<Hk$GOOS7Mc%k&+iG*UJY{wrP3iwS=FPUF{phuMk@w-Mva'
+    '4&$s&ACOdL7?rMf!W<5z8?qr+(2X-Jl-3HQ!)N#ZGDdz0CemCVew|K2FWfoA6`OJ6l@&>G44NL7Fyxq?(GstokWOU#Z}7+zE'
+    '&6x%78d|4-zsjfBlNzYMzeZF%iz+W*dWb-82sh4`CqoMPW0mo4Nt_h@`&*Y9Cuy*614ge-g?q+%BHr!IWj<#Z)TaYP<8IZw('
+    '^8p2`_|HHktO?8Nbhe^tJI_tRY#u04=E;SjF3Em7nY@!*PXgvyTw{4>sDM?hgweNbZH&<%aa#c01aH_<$n8gbkP;SfBCKWUw'
+    'x_A|$I2ggWw3&^Zu@}etJ9Ls&qxm)T?6~Pq-=+f;`u}hZ9U->~6&{-Q;#W7tw*>t%TPi)bpXP#<PB#Eq1ggL(jr0``SaU4Y9'
+    'F9o0V~ag_uonG)ovzbfbEX4&Nnr-F{of}T-7sRt6qDRA5zBEU4sSsQt<*lX(ij#8bKyByZq};et~+6(JWccuMa!*}o|4GIl='
+    'gI1G2$u*`~FK%CC(@_>06E+N+gg{W+5?kETy1Ydvg<dW{JEeK7cnhN|6U13SJ8ta_4D5VTEBCz`&l~o5t87P6)xNwphI*f_k'
+    's`E@ONkn$+o;eF@4Lo$aOA#{D-0wnP~MG9evNu7H!@xTZYCUw{2Z&t*@KHu4)`(ffw5YnvUw&v&KJP|0X|o=sX2IT=*Acx9;'
+    'Z{BCKttk(%8LcQEu6+(}gGx8Xawt7vwkh`6Y#mZaPhfzWS7%GEoSau;f<yV)<v*g$KN0bkFXOOIoU^?9X$+UV@wte&Q%YkzS'
+    'uxO<q)~DJ;*MEyQpaRtpbLZd9f>wG#(nROsL0ai-43qdaVT0i_LNw9P%b=xT@;H^FK5A5Q#H607l4CYjYbaVGpR8r2-Nw;4j'
+    '<93qpN-Zk40~;?P7#^>+<tYKqa(ajdW#m<$~;f%VYji$ze^?uwV909x{jbuTNcu97;T1_n29hA+C*B2CfrAf`(*}~Fe=Heek'
+    'CcswearJ#W{vv_Fd1dY!KsR7~gS%j~+ZVPU~7UIB|iWtX$@#e4qI|dIM-O-nv(JH{oS+b9UJVr`kv>`C3b=l$kcU4@~=5;xu'
+    'fTvaz9-gY6Av8cczaz&gif+sY5ZcW{RhbsLovV`V#b369k<hba^*44bjiNL7XW^pTuI*`)(5=Df8!_j7&Ea(&rap<=cZ88zg'
+    '{KO5gWx7br}ZsXEy*P%_oE*popMN;WFoZ>q0lrFQoBeYk#@GN!Guc1MnrNp-3PB|UZcH|0io*JA~Ty1+2Y@?F?Nt>|R@;?Re'
+    '=~oXE6#P>%B0MT<(O8eb3mvgl2-2rzWdiNGg=@=BHp4;~9Gyr(A4jy1;w6_vXTAbdI~`cjeVJtS1`DPF&ZLJ3p;JlOv<FNx-'
+    'ot1Fb|7htZPzz_JwdvhPegp%UO#b}4PoE?&CFYod})`gqmgQ8N-vsl@m{tHNOBtBf0||Xbe|;8Cz`)x=;I>06G@eADkDFmXU'
+    'ue~bkg+rcvR{u#{0+T&--LsbLVwTsU)CdQ4_`?E_|tY0X`Xm#8vhjIu*C?_u}(lKWJfKe}C(m79u#qeC8e~impetdaaMY8m5'
+    '*|yrQmz*zL*kwR}adHm^%zVVG#Gj=Z{=a1PCifRY-n-Km7?O-faf#aCo3o&+Q<$#isHI@m2nn;tv7sCn18{AP79CZhr4m`4q'
+    'J3oZF9%0xA$L|r~@sZ}eQ@{(F9VpC|P&Y)C#la8xndzA)DD^Evsd*7{_jt`UyKIIMf(r5Xkwfxx)JvQw_cMQpl63I>-x3^MD'
+    'E|Oc*$@g4DW6L3_6ZUIXDOwMwCPbJl$sX`=3X9Oo!_;(XQNuHJsJx>i5b$r^JUJytIGfmhuR3q^K&@0t3MY9MJDAcJ2=le}i'
+    'c5Xvj?wU7|9?`Jbd?RFi^)RQ&^md4^6v;nEfkzb2E$#$D#NB)C(P>j3D`|mv$pNiDSAD7KBsq!X#6&F^W}ODLAz#I8N!e}`C'
+    'ki9w<%K#In}|e(vx09D)yR%ffzq$3uq7xxdXq+BHFc&we%!eKae+~<aBp|W8WTm7(@l8E7AUcFGV<~<&h$!6YP{Tvjy_z=Tf'
+    'VZL(GemXv#1hq*qp68QS2}UfEEC=n@yULiu`e`CTHjqu4Z$?fP|*<d;%vjGm(fn%NXb7OfLCBv<lrBA4SjReLfwqd)jIS^Oh'
+    'FrI|j=*=z^OCM7fe&L-`gU@{Zi-k1%}oIwfa9z6&9i%ySl3u@n6^;$jgS8G!)oFrAZlmaB-^h@a1>VnFUj4t{U_9vfeA94Y}'
+    'Ff^-r6)^QvsS4sZ1E={ux!QOwnjFqK!A!Ef5L1M2CaT`RT4k5e_GeC_S9|42hjOwaV(3k+&&@$LV;g5P8&3-^dN7&Bd!kye-'
+    '4k7SG$m?W_-vKE(#S**;HCyEIMw}mBT}RF)AdF3#e^D4idsZ^#fln*f4a{bQ-eaT?2Sm8I1nV29SQx5S;1)(%jq$up~MDG+Y'
+    '?-pbw>5E+{|7E^uP345NX*{3E77pF>^{qN@q{$KW|t4%H{&~62@oKJb5s4u#fm?sIms0i9J%J3+<7@w9#duItioW(-|5IJ1J'
+    ')>K&7H2$WeCuiO!pU9_7@pOiumsd_HZXpDTt!t%m~SHy#*oc(nc-P6_G6z*&Qi*hPQpK$(S47`st51k4QD^5{DDzF+lfDeF_'
+    '4O5@Qrz+T^zA;ho10CI=goX~deW^U~~x}^VdKFlW<#oUzRzi8hX<)YUD0;ZbE^r*5)5oMlZy@wqcv`9^g{#S_oSBU()xEFw)'
+    '%EX>r3u(dxT+TWk0UkcUPXfbX0@lDuDReYRHP&uj-VvVg`!gD6bKQ?tB}CSNG~S%f$9CXI)=EHKRL_hY)e}@Uo*X?9(15qKl'
+    '^Eds>IyrbqGztI{O~JbVUUKj2tv1_ILOJ4ak|Pt)k|x4+cI|@NLWtN&dp*#zgE^-In_k9{QN?D`$yrDD=|~?XX~}+Yx3L2yL'
+    'vCbeCrM919-1wrf!<60pwBHLb7!ocabNGa^kO|wK)jy1Heobztl|kJ5%+VK}tTcxfw$Wd*ei1?-MV!s%U$yO9Dtro%&P#%!&'
+    'U=B;>3{Dz}v@UM4q^#-3kmB*BFq(%o3v4bH$Cm+G}ZuRN%G(FM(L(S5IhbEPXcXAA|^oYOJ=Tl-GkI)@%x1XS%wg2;14He|v'
+    '-t1<hac<~CZc9~zyOh!+yx$+w~Vx2Kryf^2Q%TT*uo@6&AAXHsezhG{v=B^^{bfi5e#Fy6j!GN*zJ$^}HT)XnadeS0YL0Ini'
+    '?xlZ^FGOsT*RN|8H^871x0w1Hj6s!##{44F(5U7c>zk4(q-$r0O6l79c7712u>`SjRGj4(MdJvBjXi@6BNjgIRJy9HAMj7|X'
+    'QRwDTT{pET>PP9&InMS?iRFSmlNlnoL9MEnCzqJOvb;ck{}ueGF$D`EnBZEh-l@~lbS!xnAr|WeOc?gn7pCRZ$3WV-Rxh2hy'
+    'ap0UNcof(8E=2$^=AF6MkNE?Z#*eD+lKo(_5A3VMzz60Q>EY3GcHXs&ifu+&i*~Pd4EIH%~8z&O;E^E4BlL!yKMIbsdH8eTp'
+    'LCDF3PR7_4Wkwbz0-#=C32a(5br$grt(ZX|UF@~Rxltx&0K@2v0S7>C)N!CE)9GYW{{`nR5>zi6xvjMBuy;Bc%T_B$lrxDP!'
+    '=RSD*#6BoyF%l&JXlgy5_QGrdWW`z|gP%BbNYq({~<I7bPW56~-DX2zG<}ka{F(ap9aGSj;|Fn}O)Nkb^z(A~Mi@0a@h`Raw'
+    'aHW0xSKjydg1*0BiD`?Lpl1th${Skqx<bJ!1a#|<u<Lc0CI8qImFm{A$du>a8bEgW7pNfhx#cVMCZvZAzil#AS{5;rXWPbX?'
+    'F=YtknH1z+mhrB*ewIP)jqbIR@R;c12Q`}Wu@3PjONh%{i8|r|Fm+0E6g|1WsoII(ehj-sIyTj=7x(;hm5pq941Y;4(zC>-='
+    '#d-R3r6%XOii*w$l~rQ{K-?_FLh=6DP+r;$JtF(%~KQBDg41{uF6~;wq3z_OJxq?&5HOjmk=%x-cre*bcytKu-NnIuARQ_`B'
+    'FJtI2y3Al1Two3mfp1~v>`j8kNUnL$)1_1)ZP*-mNdPieL7)FX*9=-3ODjp(T(>z)^DqP4q$)%8yuh(m8`%BGgQOeA8GHhjL'
+    'OE)Hhw?>NZYPXo6pcI{inBEW$iTx0Z%(e=g%kr+?0pot$4*UA*&@{uX9Ol~@J2Vz2=B@*!)B3{bT($*EOMZZ=?--NrA<A>F8'
+    'V{u7E1Nb>Bc>^&(5oh1eyzR(wLyMEW>S;@eY8cyToGm1Aqsv5_@P=7iI~o&Kn#PhoM4Y!xKUna^rMX9?<gC84xqC`WFP)f;d'
+    'Yx72@2l`qD$7=}xk&X-IWQ_GA6~{;+5w6S81wG(b1b}O(;A+yYFpL8p+BX9izfxsCybFc^8c-DwGB?XUE|A>SYtBUA{BKZ#7'
+    'C1Clf(b%N^nh6FJ1UXF$>=kES1_kk}NH~0UBp=<<uOnwM-*<GMnnDJC~-*yRBBo0mQ?nz4%lDrL_&+FqWaloo8I39Czg0p3U'
+    'fVna*Bb8a!FnCU{bnadEZ>3E$AVb{is}c{T>wHurigPKp-Hve)dI4dJQdB6DOMJt&_Wj(9R<a;Nefa=4^$bF`^;ZOpM9aT9M'
+    '?RjkokU``#iPQA@tG>tpn>AlZAn_5mH2%^$M*2LniCbYk-a<5pP9m7^8;YvxOKfKuXf2PmOk^6J__4UmSeJ?iCH(4@zql%$m'
+    '3EdMLx!QM$jISAkSd>Zf=p-jz@w?`1w_cs7MCRyp!M?_9#+%A|ES3$~#B!;tWPhbRnh%EE@@<`VOEcuX<g)HnC#p_0L0|)9g'
+    'S<X=0dH5y_DLp|St$8wtJccI*2}A+s?238nfd;4VO~<3rhOQyu1$$Y(>cm&{j{|mahX%!i+;>SQRQd5PMWe9R_+P%DH@N5{q'
+    'VC{_z_p+4L_Pi87!E%>y0&HyXt6_G7;3~byWYR8J2;IN7ICADb(fH_tG(}wzZ!t(}p!>=`2c!<<sZ~8R|sfLpFL=-Eit?WEp'
+    'T}7V%vi#OeE#UPrkc2Gvoy!?L;dR+$}24rsj=KQFt+w<`}pc?*f;qj(?a0F!bkmRltD%4_=Vj!`N?j!&)m4Q<-Ae8YDm_|l$'
+    '6`)}H5S9h76yq@L>&BSnHG0br?IWac$6IE&>=n|5bOCxM*=L2U?y;H~cLw8~nElzx40pmkdG1<&_*{{Y?N=dVcA~!Q7o`k=g'
+    'w&@u}U$nV%lBJO|uMZl0>QY{L9Qh+10~-new)qq~G^TZX(OrlgcH%mpjFjt>B2Oo$Q9E7hY?p0i0cCAkWyKaq^z&Nkm;88gl'
+    'd6&%h#766AM@49iF*~QVg{8p0HgHT0f44gkxS<3IuyRv%V*SD=JC_=wq{!ahg=Mmm6A8zP+5Y=#mA-k<4lcyzFuplb;F2=Rx'
+    '=u(%C>=yX-$7Aqgtm@o6@Iv+6mpR#(?B`Ycxd1n2x%-g-J-F79K~}8fi1Aq-!e4b@hn>vk2TmeLqmTt?-LFP*s(s@^f`vIT~'
+    'PI7^9(U?H+PV5{klQs^X9tvhX%vYliAsrPA_G5V%$bsui2kJR*0z)*NwN@k*tnjs(yDL^ED%@doXp5R@qAWmREb<eY|NOK3<'
+    'p8m=Cpl6d*4S=ZWKdNauFCw&X8{3N7aJ}1+WpN+&O(Vxf>ie95&RDi~LN>joy`=F~|eVG}unn?4u7a*rLe)jA1)^AwyR=J3G'
+    '69`8sTgk8&Aw@gTJ1;?#)^H-7&Ci;PZ7_b5sqcg8wQ+$|>oLuIpQuK);rAsaFw|R{O6E)ggKZ0g?T)Gva%IAVJAMblzz@me9'
+    'oCZTaHmLD?G<p4cePi7?{eh}D!D?O*~qh<Ej*ymXkJ{okYCPi#Gu(UE{oitOauFhYYPR6wCg`HRB^SW;yA{)yV06`y}C=TXr'
+    'Mq}(G3+H1ZL(2&>4YJ+8l>UUs6RL=XA7~K40N%cj2I;9CFv3omSi~lyl&Pzn9q6@4~`BxonlSQX}eH5qpZ$;bkTsn51>S<tx'
+    'ln6xf(zQ6NKo`=O~K)7&%AdO0jo<vtjz>ZQ|Y9O;NT^2k!V*mTJmC!D&iJH5@uZROuIzC*|zE$Duju=^1LFHz(nE5o_~ev*F'
+    '@4drTM?UJs-@;HInw9|`BZmE|>_q9kaN`5^;DE=71X!byH6tY@{<7)+EgOD_k{$WBgEhxRb#)ecybZ;JrxDhjkR|aFP-qP1m'
+    'm3mH{%qxqYi$u+O?GbHC-HRgk$38EaSKp*1*}j*l3ShvNO?Rs6I3jcUH}6u!iw*Bz2k+*yR$n-lXAdHlb~c`KC<lAPvYwB{w'
+    'TErxG)8K%xv3b$DUT&RPcO{KkVtF)Q&h`1v3OIXF(}ul5iJr3hFY_35ti0-#T(zoFLrvoCWQaM%B<RiQL#aJ-CiikRgf{I33'
+    'MSQQGzMFZYx*)fvJ)a5n<SGujxXV3CyH+?4R6~iX&3#CfKE#VZaiuL<{V$q3LX+o_cjvr_8B)pL%N)C#w41`VpnZ`Iai)VQ1'
+    '&y^2#OQ^Q&kT*=);1Aw~`M*kT%%vlM7cma{lKe@Pa4RGyez2`^Q~!%egQ{bv8^(Eoe>3wz2RjncC9ys!nC>_k4X=N{LC_2`I'
+    '^M*EWT9yJ0<6)l`J7A;oAMPd|3*a>Te>WU}XS|`5vQjg0PGJaACq$1~787eQe#BHn*+5KD@lPK`Rn1Xe_ayB?N5W$%Oy}0q('
+    '_-VN%T?TRfe(?s8+CIXp-|}_%4RAY|iW)N^!@3FyO>lhu*6WVhX6j@IKBh!VV@clb22dwsRqN>JsMYyaZ_;U&w3k~z_E|Pi>'
+    'TL_9rcJZQiIJMH5G&{YXnti;8#)!)d@F6n4%*jjJhufyn-(=Y-WjH;-iMtyQS;;bw{w@&W?@x28~3zUUXf84g_l@h8<(UL(X'
+    'FB9+bgnmbctn&QY@qbd%W0aW$Dx7dEXpsPvDL=L1j80MVu(kFKbd|(zlASDeukxtehQf?hy1iUCAMP$zV4kx~o`dDuSl&dX@'
+    '`BfkQi2k<8tf&tB*;+_6bQ(#$|UuTf0ANwApgQ0<z6=rbFD<C68G+|UHq>#7{=F;pbNQLW?>tk9OQra1&pwN>J+v7s^TFa+i'
+    'a<&VaqeMfDlXp_r&Q&v2)q@l!blaa%o1z#;Z7ktabgRFgeOC{`iLr=Cv(KUmOhD(g_EtjyAb>@w>g%Wf}8SeQ$pq@X=wiJ`;'
+    '{5I{`MeQs>RpsW4H{GddhVMW{iLW0<LW_cLo$|d22*QeTMg?)!Fut2#2+s=+iN0`ia`n3hwuU(oLuNCIeY|kf`6Wn?RV{wRE'
+    'g`m<IgL(uB6RXWND4zgjfRS)*$A!CCWwi(>S3yKVm4Qdvr7f;ziw79s>gne1chV`>W|AGj$UsF_2Rs4=x<06=D^W_21R|zjB'
+    'IV0l}ZW9#!PQ~_Bk<6*xW>@X0~RJQKT|fn{hf@m7CQs@we8A58U@Eo!Vl=j)kKIyV2M$eR>&)6E*&L+|!jwsi!@665}K;8Mg'
+    'l!_aB8cvPMvrI&2L!UHs~_YXx4rcTUo5eGzz-Z#W-R5dPAsDueP#s$*xK*xZ(Ns%@$TdDQz@{2UdtQ?9)5E8hNW7USCFi|*o'
+    '#{I-Mle<I02A^~XXru90<>%@G@rPJJ%qP&iJ?%dO&U@Du-mJE;BFM_kfTmbQg`4=PqX-DFTcjcoq-@b;H$J6l#&@e~8Su^>x'
+    '46BU$p&i5b9Id@XY_B|ozB8IiJC=pU;iBhfAlT?Dq<2muUM!m}OOG2I>r&Iv=ZYu>&Yq)H2irEs{%{!LCXN7#pQWPM5YyScX'
+    '?mXf79Kv*yBy}q{wzu$mVVHadcukx!VIh~>qJL*`D8TjVsftcelbIN)M<Zmle$ovZ~k)kY0$=KTaN$RMYVn_PL^FOb&K>s<?'
+    '_xi&YTv$u2glxp^1Q3HBQv*ZKazs)sL)_w33TbnYu2ME)}M%fiCpiMG~I*sX@qvQcB@rl)I17=<6H;HkHz>NH~@iMYkN-Zq3'
+    '$1;xZkUNUH_vUb#~C*!ve*>fL+GHtAf!tXA;-Oqa*i9Q3p8m$rCuIy)&^^j3DGW%hE836-IRG6hK0o#2oV8b!$be#y4QWs5P'
+    '=&i0d?P1F{PuL+sez9CI|Iqwv6Bv2HB#R-@>N1aNdsy8^_5quXyH?z0pmD>*Q`67rS?xmycbLAj7gSvTBi6|d(kI8!z--3Lr'
+    'wHoqm{Ei}X3vg*3<%w-W8}vov$SX!pHxWqID6^AtG@EPTf2kwgq|9qS-|S#HD2s$Uj2Wgqs$9-V0W$+m5q<se?)F-wJG|(hi'
+    'Ij+?uVjdvIAS!kirjzv)QYK;ib6e5mO?kDl9+Zj`h*m^lCH!m9@z4D!s}v}^P^!$3Es7S!dsnqli&1k)4piP1Qc{si9Ou}!N'
+    'WdVA1mXhVAtEryY9$US3BuWbLXe-K~jW5M)oU*h)va&Gg$0%FB!0>7ZQ%EpmEH4xg5AQtGbft>ue(1+zeg~UCvv<PGfc)CD&'
+    '4^P}j<wRc~xnca=hgYH-WNa+smE6^~U#4El3E;TjAh{&U8EF6qxDf4f|$zm{{PPZTo+P8t#f2<}J~lTu4USj~`~vzjKJc{y>'
+    'FNhL7w^&PCNHAQh$Q{JtgV-VTCG~)<V3Et((o4-(X875J?vp$z_nFYp}FjX{-H;vo})~c3EOlq&EN52%NbzMC*SUOvsS~8!%'
+    'v+&X1r&;VbpqxHcVpf%~82=?qKM@g<44W>+t)}pEU?W{?x)_*>(>I;i&1%xL>=jpxNz;XFmF9_RG>wy#Thy`j@RX~Ryx|Lsl'
+    'NqWsiZr!a({IOsJl};hA-r_BSQmSD(I(h9ueH0g{voz~zHZ9ULefi%SKsj2aftJG=>T-4u^*FgAbYjA?3cTYEkS#znbW1yx#'
+    'HJ)NSkVt-ldn;)lt$tmjU83KKdi^QXBP+DIaFmI7`D(WJ}1W!T#CJ^u6Z5S7(PXHfwp0%f~pG*M_`lkDm&@rxsJz&>Jcb3D?'
+    '&opSD*j5)0EI{_6L<G11id>2(>8yumV09oeT|#r!&}3jeCA5S?aYu{GvPb%!$VFVv|pu9P{mpL{xcW9QH2-rof^4(xSBW;~C'
+    'NLMGa}N?l61_NhuH7ky=%=d1MBHbGt)D?ofCZc;M__7Bc-MoK^(1*Qr;s?{<=iSd)hlHfy5Twh$I!!cYzvr=m-1~&VoszVj+'
+    '7u#}|)C>&9U7fvjSrU&1r?Ps93QaKh=w)hrDe9cATE;h&Qe3Tm^--LOH}x<Oy8d?%Ts|*o707<nwy|821G~Z0UDB+Ti%-l7Z'
+    '?i=q=gN@b3LaYOWKCvom3ir+(L2o;0k+k7SPnzg#OPQY@!lypB0GvCuQSaQ;l02&<8?gw?+X$(zJ!xxDSAyw6$2YdGMS=mqb'
+    'f8MapG%h*IGHuzwwvUoHI~w8-bo)E3pLmn@sBt96jMM2jed1`SDff{gcleoE<Qi^Y0J$ruc|`dxh%C&qBdxJCzWKkwd&b{_k'
+    'Gk({s3f)TWb4d9K~w-5iRXBXAU}FRlfQJNBer*MnMBxZ3D24?XrkUky0s?&0C{<K5wl_X~8n=i8T)XiuywwQn}MVtRUT)S3S'
+    '6k;da6^jP}WTm2Owj6bA{i)-?{|8;*|?-ghohQ#X)=i^()u2#UP#HIi@i%^c|89LhoSG#uo&Z$V;%OGRQ&PI=z_d*i!CaIew'
+    'i=M4$%z4ZAGCKw<e52MBvlcs?dj7spDJ1MD>2TLhK_^kPk2M)&aXuiA*kPYz$BGQ{t<RlLg#F{^hy63k6?#MFOO|*rs9~}+P'
+    't~0hyllG<l%F02oz~Z1_RsXw-Q(^4_mg7SZ}5oj!U5^|>_*`Ge6&4i*F?KAPYOG(M+T*1m}-$5Z7><}$BFK2rvxt*?u94Ss?'
+    'x1GpnDh~#-A#=QK-<@t3tK2Qwpw2?##Sv&T-q)+mh^2Q3W|^3>!7=RC7}lgLOL_TtU$O$~@4}skg}<4HPN&^!&xJ+m-lT8Rp'
+    '}2!9eFG>v(XfD;<HB@?1UT3tp5<mY?3#14QI$yH<%>hqgNJ(93>e64Y_(YUKyY@n>w;B2DY-H*3%=lF=%hmrFg_G_6)v!j_L'
+    '$Dw&^(-x|2_Ot9{-FFymiqmLdAC%a?;mNm_yYmeALjmHsy&phPnewPw4*$m<expXI@1fK@Q=f7UppZ7Q;^Edw_B^>fSvJhq*'
+    '84QF;M<-Vo#DEgibI#=o(#6u{nz}A2er*55X$u<HE^9;^bBu;wGDVTg8X{Aq>GB&MPe-#9$9qHii^ART?lHS6nPbK!juG5_='
+    '|e4o?32YCbou(BXI|v|AAH~ILWPXqjTRaz4%C>gd{)%?_JT}-?PPQec<QFe=Rq+rT(;B~&mhAj`*8!g%!-zy1t3L{$%XIG1|'
+    'c@!%s@j!#hk~6Ul>`?Iiz}mIW1~Usdj-i+qIQ$9teV9$IvTRH}{B*=0?cwRePf3E5zlAtjLg}vJx7G(qsV62`4+a7p-70L7O'
+    'E=8{vIz9QztIjh0douFjq-XU3vgCz0?}A}6ylhB7@`V<cO%WHX0j-tSf>*3{k!e5r;RGGDDPuX@T^4MK(H(zO4pb!DCAzQX?'
+    'm5AvgnKAz&o7yaosb--oML_c8EjwJaYdhmSfHARz55Rp;Vns1<4LdXZCjZ#7Dbm+GOZhIj>+ZCN+7;SZVbC-N?D)5-wy#&B3'
+    'Ewl3cQWMh15^!rsuv2=R8*%7>DSB<|A9|3dC&)(#xN#hh(wmg=8?|HSDb`3Wzw$t~rY2oiHkB)W+_ZRGFy0RQ)(z1Z+OX00b'
+    'eWG|1>~#F@VP*N^yU&mHu_Qzx8rz@6dKzK7)iuf;7<EhL(!n7TWW+!J!B_YC4jLSfk%m=DV(7?pN6N#$|-f`{W4itY@@D1);'
+    '6yEC)ZB@jwe=mZcpmxtDBS5w8C$d8a<yhOsw*wp3*se_;_AFePDMC8`&U!W<NRIMw{j>23fyMDNACalb72o3h?s|^bT2Ztab'
+    '3i4XVx6_5Q{ri^m7=aW(tP9>1ptq5=L7tu*M4'
+)
+exec(compile(_z.decompress(_b.b85decode(''.join(_d))), __name__, 'exec'), globals())
+del _z, _b, _d
