@@ -1,0 +1,173 @@
+{
+  "bots": {
+    "logan": {
+      "path": "agents/logan.py",
+      "sha256": "aa18c44b6220b78988d822827586492bff2838a4dba43c8ff21751b402ce0ebe"
+    },
+    "riaan": {
+      "path": "agents/riaan.py",
+      "sha256": "f9ab759cf6fc5572cb57efe1c236c57220020240d5ebca2ab2fdad5477c1e51f"
+    },
+    "sid": {
+      "path": "agents/sid.py",
+      "sha256": "c41c91098c700081232a92599cfd66492b231b0fc4a4ec7ca5bb45cdbbc0f871"
+    },
+    "will": {
+      "path": "agents/will.py",
+      "sha256": "878c4fb6de604020a82b8da72b78bdddd22e16360bf07fc1e0e3e80dfc57f285"
+    }
+  },
+  "engine_sha256": "8796130ed5e76940b6467469d3f448d85cb82a8acda2ad6401ea24654cb7ed12",
+  "games": 5000,
+  "time_limit": 0.001,
+  "seed": 88172459,
+  "batch": 5000,
+  "jobs": 1,
+  "permute": false,
+  "live_button": true,
+  "wins": {
+    "will": 969,
+    "logan": 1458,
+    "riaan": 1324,
+    "sid": 1249
+  },
+  "rates": {
+    "logan": 0.2916,
+    "riaan": 0.2648,
+    "sid": 0.2498,
+    "will": 0.1938
+  },
+  "comparisons": {
+    "riaan": {
+      "gap": 0.0268,
+      "ci95": [
+        0.006137439417071271,
+        0.047462560582928734
+      ],
+      "ci99_familywise": [
+        -0.004141130260661135,
+        0.05774113026066113
+      ]
+    },
+    "sid": {
+      "gap": 0.0418,
+      "ci95": [
+        0.021437632540315943,
+        0.06216236745968405
+      ],
+      "ci99_familywise": [
+        0.011308393625422089,
+        0.0722916063745779
+      ]
+    },
+    "will": {
+      "gap": 0.0978,
+      "ci95": [
+        0.07867949608061545,
+        0.11692050391938455
+      ],
+      "ci99_familywise": [
+        0.06916802091663589,
+        0.12643197908336412
+      ]
+    }
+  },
+  "failures": {},
+  "actions": {
+    "will:preflop:raise": 21660,
+    "logan:preflop:fold": 38143,
+    "riaan:preflop:fold": 37462,
+    "sid:preflop:raise": 23525,
+    "will:preflop:call": 22478,
+    "sid:flop:bet": 3194,
+    "will:flop:fold": 4083,
+    "riaan:preflop:raise": 23212,
+    "sid:preflop:call": 18937,
+    "will:preflop:fold": 28229,
+    "riaan:flop:call": 2703,
+    "sid:turn:check": 6516,
+    "riaan:turn:check": 4019,
+    "sid:river:bet": 1576,
+    "riaan:river:call": 1367,
+    "will:flop:check": 16075,
+    "sid:flop:check": 7739,
+    "will:turn:check": 12770,
+    "will:river:check": 10490,
+    "sid:river:check": 5377,
+    "logan:preflop:call": 11767,
+    "riaan:preflop:call": 11861,
+    "logan:flop:check": 2008,
+    "riaan:flop:check": 4716,
+    "logan:turn:check": 1443,
+    "logan:river:check": 932,
+    "riaan:river:check": 2836,
+    "logan:river:fold": 693,
+    "riaan:river:fold": 865,
+    "logan:preflop:raise": 25801,
+    "logan:flop:bet": 10502,
+    "sid:flop:call": 1503,
+    "logan:turn:bet": 7905,
+    "sid:turn:call": 1261,
+    "logan:river:bet": 6420,
+    "sid:river:fold": 1315,
+    "sid:preflop:fold": 36495,
+    "riaan:turn:bet": 2040,
+    "will:turn:call": 6043,
+    "riaan:river:bet": 1747,
+    "will:river:call": 5578,
+    "sid:preflop:allin": 9946,
+    "logan:preflop:allin": 14317,
+    "riaan:preflop:allin": 12842,
+    "sid:turn:fold": 751,
+    "will:flop:call": 6832,
+    "logan:preflop:check": 947,
+    "will:flop:bet": 382,
+    "sid:flop:fold": 1031,
+    "riaan:flop:bet": 3682,
+    "sid:river:call": 639,
+    "logan:flop:fold": 854,
+    "riaan:river:allin": 516,
+    "will:turn:bet": 750,
+    "logan:turn:call": 414,
+    "will:river:bet": 1091,
+    "will:river:allin": 173,
+    "will:preflop:allin": 4164,
+    "riaan:turn:fold": 829,
+    "will:turn:fold": 1013,
+    "riaan:flop:fold": 918,
+    "logan:river:allin": 621,
+    "logan:flop:call": 636,
+    "sid:turn:bet": 1987,
+    "logan:turn:fold": 800,
+    "logan:river:call": 342,
+    "will:river:fold": 523,
+    "logan:turn:allin": 307,
+    "sid:river:allin": 411,
+    "riaan:turn:call": 2094,
+    "riaan:river:raise": 280,
+    "will:river:raise": 237,
+    "sid:turn:allin": 315,
+    "will:preflop:check": 409,
+    "sid:turn:raise": 143,
+    "sid:flop:allin": 233,
+    "riaan:turn:raise": 340,
+    "will:turn:raise": 205,
+    "riaan:preflop:check": 319,
+    "sid:flop:raise": 191,
+    "riaan:turn:allin": 265,
+    "riaan:flop:raise": 386,
+    "riaan:flop:allin": 118,
+    "sid:river:raise": 86,
+    "logan:river:raise": 57,
+    "will:turn:allin": 68,
+    "will:flop:raise": 120,
+    "logan:turn:raise": 62,
+    "logan:flop:raise": 71,
+    "will:flop:allin": 25,
+    "logan:flop:allin": 60,
+    "sid:preflop:check": 20
+  },
+  "seconds": 108.51736563700251,
+  "upstream_commit": "9b3ad131cf0d358ce71084c26e1738338ae63733",
+  "button_policy": "carry between games, as live viewer"
+}
