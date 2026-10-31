@@ -276,6 +276,30 @@ class SidTests(unittest.TestCase):
         self.assertAlmostEqual(sid.Agent.quick_call_value(view, 0, {1: (0.6, 0.2)}, 0.9),
                                200 * (0.6 + 0.2 / 2) * 0.9)
 
+    def test_fast_call_keeps_upstream_runout_equity_calibration(self):
+        dealer = poker.Dealer(3)
+        dealer.start_hand()
+        dealer.act(0, "raise", 100)
+        dealer.act(1, "call")
+        dealer.act(2, "call")
+        dealer.new_street("flop")
+        dealer.board = ["2♠", "3♥", "8♦"]
+        dealer.hands[0] = ["A♠", "A♥"]
+        dealer.act(1, "bet", 900)
+        dealer.act(2, "call")
+        view = sid.View(dealer.view(0))
+        bot = sid.Agent()
+        # Made-hand ranking alone says we lose. The merged bot must still use
+        # upstream's calibrated equity for cards that have not arrived yet.
+        def rank(a, b, board):
+            return 0 if (a, b) == tuple(view.hole) else 1
+        with patch.object(sid, "strength", side_effect=rank):
+            with patch.object(sid, "beat_equity", return_value=0.75) as calibration:
+                self.assertEqual(bot.quick_postflop(view), ("call", 0))
+                self.assertEqual(calibration.call_count, 2)
+            with patch.object(sid, "beat_equity", return_value=0.1):
+                self.assertEqual(bot.quick_postflop(view), ("fold", 0))
+
     def test_postflop_contract_at_supported_clock_profiles(self):
         bot = sid.Agent()
         bot.rng.seed(171)

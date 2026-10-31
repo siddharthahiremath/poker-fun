@@ -12,7 +12,8 @@ The fast path now values each side pot separately and accounts for multiway
 ties correctly. The betting thresholds, opponent sampling, and preflop policy
 are unchanged. Broader strategy experiments that lost ground were rejected.
 
-Fresh-seed comparison at 1 ms, all six seat orders, 1,000 games per order:
+Isolated correction against `48203fa`, at 1 ms, all six seat orders,
+1,000 games per order:
 
 | Version | Games | Sid wins | Logan wins | Will wins | Action notes |
 | --- | ---: | ---: | ---: | ---: | --- |
@@ -25,8 +26,52 @@ Sid led this three-player run, but the margin over Logan does not establish
 consistent dominance. The verified improvement is avoiding incorrect folds in
 profitable side pots and guaranteed multiway chops.
 
-The regression suite now has **23 passing tests**, including direct checks of
-those fast-path decisions. Only Sid's code was unpacked during this work.
+### Preserving the newer upstream update
+
+Upstream commit `c053b5b` arrived during testing. Its bluff reads and calibrated
+flop/turn equity were preserved in the merge, rather than replaced by the older
+Sid implementation. On the river the fast path uses explicit win/tie probabilities;
+before the river it retains upstream's calibrated runout equity.
+
+Fresh comparison of that upstream version and the merged bot, using base seed
+991603, the same six seat orders, and 6,000 games per version:
+
+| Version | Games | Sid wins | Logan wins | Will wins | Action notes |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Upstream `c053b5b`, seed 991603 | 6,000 | 2,232 (37.2%) | 2,000 | 1,768 | None |
+| Merged bot, seed 991603 | 6,000 | 2,205 (36.8%) | 2,002 | 1,793 | None |
+| Merged bot, independent seed 702971 | 6,000 | 2,183 (36.4%) | 2,018 | 1,799 | None |
+| Merged bot, combined | 12,000 | 4,388 (36.6%) | 4,020 (33.5%) | 3,592 (29.9%) | None |
+
+The small difference is not evidence of a strength gain over the upstream update.
+Both versions led this three-player run. The merge retains the verified side-pot
+and tie fixes without discarding that update.
+The merged bot led both independent 6,000-game batches. These are measurements
+against the current opponents at 1 ms, not a guarantee against future bot updates.
+
+The merged bot's 10 ms compatibility run (600 games, seed 911004, one worker)
+finished with Sid 229, Logan 186, and Will 185 wins, with no action notes.
+The 100 ms compatibility run (180 games, seed 911005, one worker) finished with
+Sid 63, Logan 51, and Will 66 wins, also with no action notes. These smaller runs
+check compatibility, not a reliable strength edge at those clocks.
+
+### Merged bot, heads-up at 1 ms
+
+| Opponent | Games | Sid wins | Win rate | Action notes |
+| --- | ---: | ---: | ---: | --- |
+| Logan | 3,000 | 1,556 | 51.9% | None |
+| Will | 3,000 | 1,727 | 57.6% | None |
+
+```sh
+python3 bench/arena.py --games 3000 --procs 1 --time 0.001 --seed 714601 --diagnostics --json agents/sid.py agents/logan.py
+python3 bench/arena.py --games 3000 --procs 1 --time 0.001 --seed 714602 --diagnostics --json agents/sid.py agents/will.py
+```
+
+The heads-up margin against Logan is modest. Do not read it as a guarantee of
+dominance, or compare it directly with the older results at a different clock.
+
+The regression suite now has **24 passing tests**, including a check that the
+merge still uses upstream's runout-equity calibration. Only Sid's code was unpacked.
 
 ## Earlier 10 ms heads-up checks
 
