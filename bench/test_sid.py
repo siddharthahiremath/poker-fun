@@ -211,6 +211,71 @@ class SidTests(unittest.TestCase):
         view = sid.View(dealer.view(0))
         self.assertEqual(sid.Agent().realization(view, [1], False), 1.0)
 
+    def test_fast_path_calls_a_guaranteed_three_way_chop(self):
+        dealer = poker.Dealer(3)
+        dealer.start_hand()
+        dealer.act(0, "raise", 100)
+        dealer.act(1, "call")
+        dealer.act(2, "call")
+        dealer.new_street("river")
+        dealer.act(1, "bet", 900)
+        dealer.act(2, "call")
+        dealer.board = ["10♠", "J♠", "Q♠", "K♠", "A♠"]
+        dealer.hands[0] = ["2♥", "3♦"]
+        view = sid.View(dealer.view(0))
+        bot = sid.Agent()
+        bot.rng.seed(173)
+        self.assertEqual(bot.quick_postflop(view), ("call", 0))
+
+    def test_fast_call_values_the_side_pot_without_the_short_stack(self):
+        dealer = poker.Dealer(3)
+        dealer.stacks = [1000, 100, 1000]
+        dealer.start_hand()
+        dealer.act(0, "call")
+        dealer.act(1, "raise", 100)
+        dealer.act(2, "call")
+        dealer.act(0, "call")
+        dealer.new_street("flop")
+        dealer.board = ["K♦", "2♣", "4♥"]
+        dealer.act(2, "bet", 900)
+        view = sid.View(dealer.view(0))
+        self.assertEqual(sid.Agent.quick_call_value(
+            view, 900, {1: (0.0, 0.0), 2: (1.0, 0.0)}, 1.0), 1800)
+        self.assertEqual(sid.Agent.quick_call_value(
+            view, 900, {1: (0.0, 0.0), 2: (0.0, 0.0)}, 1.0), 0)
+
+    def test_fast_call_values_partial_multiway_ties(self):
+        dealer = poker.Dealer(3, stack=100)
+        dealer.start_hand()
+        dealer.act(0, "raise", 100)
+        dealer.act(1, "call")
+        dealer.act(2, "call")
+        view = sid.View(dealer.view(0))
+        # Win outright 1/4, tie one opponent 1/2, tie both 1/4.
+        expected = 300 * (0.25 + 0.5 / 2 + 0.25 / 3)
+        actual = sid.Agent.quick_call_value(view, 0, {1: (0.5, 0.5), 2: (0.5, 0.5)}, 1.0)
+        self.assertAlmostEqual(actual, expected)
+
+    def test_fast_call_keeps_uncontested_money_at_full_value(self):
+        dealer = poker.Dealer(3)
+        dealer.stacks = [1000, 100, 1000]
+        dealer.start_hand()
+        dealer.act(0, "raise", 1000)
+        dealer.act(1, "call")
+        dealer.act(2, "call")
+        dealer.folded[2] = True
+        view = sid.View(dealer.view(0))
+        self.assertEqual(sid.Agent.quick_call_value(view, 0, {1: (0.0, 0.0)}, 0.5), 1800)
+
+    def test_fast_call_preserves_heads_up_equity(self):
+        dealer = poker.Dealer(2, stack=100)
+        dealer.start_hand()
+        dealer.act(0, "raise", 100)
+        dealer.act(1, "call")
+        view = sid.View(dealer.view(0))
+        self.assertAlmostEqual(sid.Agent.quick_call_value(view, 0, {1: (0.6, 0.2)}, 0.9),
+                               200 * (0.6 + 0.2 / 2) * 0.9)
+
     def test_postflop_contract_at_supported_clock_profiles(self):
         bot = sid.Agent()
         bot.rng.seed(171)

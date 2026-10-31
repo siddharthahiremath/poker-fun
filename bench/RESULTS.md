@@ -3,7 +3,32 @@
 Only Sid's source was unpacked. Opponents were exercised through normal matches,
 not inspected or deobfuscated. Engine rules and opponent files were unchanged.
 
-## Final heads-up checks
+## Primary-clock follow-up: 1 ms
+
+The user clarified that the usual setting is **option 1, 0.001 seconds**, with
+0.01 and 0.1 seconds also used. One second was not the intended target.
+
+The fast path now values each side pot separately and accounts for multiway
+ties correctly. The betting thresholds, opponent sampling, and preflop policy
+are unchanged. Broader strategy experiments that lost ground were rejected.
+
+Fresh-seed comparison at 1 ms, all six seat orders, 1,000 games per order:
+
+| Version | Games | Sid wins | Logan wins | Will wins | Action notes |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Before fast-path correction | 6,000 | 2,167 (36.1%) | 2,063 | 1,770 | None |
+| Corrected fast path | 6,000 | 2,184 (36.4%) | 2,121 | 1,695 | None |
+
+Base seed: 831551, with 7,919 added per seat-order job; two workers.
+The 0.3-percentage-point improvement is too small to establish a strength gain.
+Sid led this three-player run, but the margin over Logan does not establish
+consistent dominance. The verified improvement is avoiding incorrect folds in
+profitable side pots and guaranteed multiway chops.
+
+The regression suite now has **23 passing tests**, including direct checks of
+those fast-path decisions. Only Sid's code was unpacked during this work.
+
+## Earlier 10 ms heads-up checks
 
 At **0.01 seconds per move**, with the final side-pot, range, and table-cache changes:
 
