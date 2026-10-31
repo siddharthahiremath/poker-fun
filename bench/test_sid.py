@@ -118,6 +118,121 @@ class SidTests(unittest.TestCase):
             action = bot.postflop(view, started + 0.03, 0.03)
         self.assertEqual(action[0], "raise")
 
+    def test_side_pots_exclude_short_stack_from_deeper_layers(self):
+        dealer = poker.Dealer(3)
+        dealer.stacks = [1000, 100, 1000]
+        dealer.start_hand()
+        dealer.act(0, "raise", 1000)
+        dealer.act(1, "call")
+        dealer.act(2, "call")
+        view = sid.View(dealer.view(0))
+        self.assertEqual(view.pot_layers(0, {}, view.live),
+                         [(300, (1, 2)), (1800, (2,))])
+        dealer.board = ["K♦", "2♣", "4♥", "7♦", "9♣"]
+        dealer.hands = [["A♠", "A♥"], ["K♠", "K♥"], ["Q♠", "Q♥"]]
+        # Sid loses the main pot but wins the side pot, not zero chips.
+        self.assertEqual(dealer.award()[0], 1800)
+
+    def test_profitable_side_pot_call_survives_lost_main_pot(self):
+        dealer = poker.Dealer(3)
+        dealer.stacks = [1000, 100, 1000]
+        dealer.start_hand()
+        dealer.act(0, "call")
+        dealer.act(1, "raise", 100)
+        dealer.act(2, "call")
+        dealer.act(0, "call")
+        dealer.new_street("flop")
+        dealer.board = ["K♦", "2♣", "4♥"]
+        dealer.hands[0] = ["A♠", "A♥"]
+        dealer.act(2, "bet", 900)
+        view = sid.View(dealer.view(0))
+        bot = sid.Agent()
+        bot.build_pool = lambda *args: [(4, 5, 0.0)]
+        # Short stack always wins the main pot; Sid always beats the deep stack.
+        bot.simulate = lambda *args: [(100, [200, 50], [0.0, 0.0], [0.5, 0.5])] * 32
+        started = time.perf_counter()
+        with patch.object(sid.time, "perf_counter", return_value=started):
+            self.assertEqual(bot.postflop(view, started + 0.03, 0.03), ("call", 0))
+
+    def test_pot_layers_keep_folded_money_but_not_folded_players(self):
+        dealer = poker.Dealer(3)
+        dealer.stacks = [1000, 100, 1000]
+        dealer.start_hand()
+        dealer.act(0, "raise", 1000)
+        dealer.act(1, "call")
+        dealer.act(2, "call")
+        dealer.folded[2] = True
+        view = sid.View(dealer.view(0))
+        self.assertEqual(view.pot_layers(0, {}, view.live),
+                         [(300, (1,)), (1800, ())])
+
+    def test_pot_layers_respect_hero_cap_and_future_calls(self):
+        dealer = poker.Dealer(3)
+        dealer.stacks = [100, 1000, 1000]
+        dealer.start_hand()
+        view = sid.View(dealer.view(0))
+        layers = view.pot_layers(100, {1: 995, 2: 990}, view.live)
+        self.assertEqual(layers, [(300, (1, 2))])
+        self.assertEqual(sum(amount for amount, _ in layers),
+                         view.winnable(100, {1: 995, 2: 990}))
+
+    def test_shove_read_preserves_depth_when_observations_match_chart(self):
+        bot, opponent = sid.Agent(), sid.Opponent()
+        opponent.counts["jam"] = [40.0, 60.0]
+        opponent.jam_expected = 60.0
+        for depth in (2, 8, 25):
+            action = (1, "preflop", "raise", "pf0", 0, True, depth, 1)
+            self.assertAlmostEqual(bot.act_share(opponent, action),
+                                   sid.shove_share(1, depth))
+
+    def test_precomputed_shove_frequencies_match_full_chart(self):
+        for behind in (1, 2, 8, 21):
+            for depth in (0.5, 1.25, 7.7, 20, 30, 100):
+                expected = sum(sid.shove_prob(behind, depth, c) * sid.CLASS_SIZE[c]
+                               for c in sid.CLASSES) / 1326
+                self.assertAlmostEqual(sid.shove_share(behind, depth), expected, places=12)
+
+    def test_shove_read_learns_aggression_and_decays_consistently(self):
+        bot, opponent = sid.Agent(), sid.Opponent()
+        opponent.counts["jam"] = [10.0, 20.0]
+        opponent.jam_expected = 10.0
+        action = (1, "preflop", "raise", "pf0", 0, True, 20, 1)
+        self.assertGreater(bot.act_share(opponent, action), sid.shove_share(1, 20))
+        opponent.decay()
+        self.assertAlmostEqual(opponent.jam_expected, 10 * sid.DECAY)
+        self.assertAlmostEqual(opponent.counts["jam"][1], 20 * sid.DECAY)
+
+    def test_no_future_betting_means_full_equity_realization(self):
+        dealer = poker.Dealer(2)
+        dealer.stacks = [1000, 100]
+        dealer.start_hand()
+        dealer.act(0, "call")
+        dealer.act(1, "raise", 100)
+        view = sid.View(dealer.view(0))
+        self.assertEqual(sid.Agent().realization(view, [1], False), 1.0)
+
+    def test_postflop_contract_at_supported_clock_profiles(self):
+        bot = sid.Agent()
+        bot.rng.seed(171)
+        for limit in (0.001, 0.01, 0.1, 1.0, 10.0):
+            for street, board in (
+                ("flop", ["2♠", "3♥", "8♦"]),
+                ("turn", ["2♠", "3♥", "8♦", "J♣"]),
+                ("river", ["2♠", "3♥", "8♦", "J♣", "Q♥"]),
+            ):
+                dealer = poker.Dealer(3)
+                dealer.start_hand()
+                dealer.new_street(street)
+                dealer.board = board
+                dealer.hands[0] = ["A♠", "A♥"]
+                dealer.act(1, "bet", 40)
+                dealer.act(2, "call")
+                info = dealer.view(0)
+                info["time_limit"] = limit
+                with patch.object(sid, "fallback", side_effect=AssertionError("unexpected fallback")):
+                    reply = bot.decide(info)
+                dealer.act(0, reply["action"], reply["amount"])
+
 
 if __name__ == "__main__":
     unittest.main()
