@@ -1,20 +1,8 @@
-# Copy this file, rename it to your name (alice.py), and leave it in agents/.
-# Required: a class named Agent with decide(info).
-#
-# Return {"action": one of fold/check/call/bet/raise, "amount": int}
-#   bet amount  = chips you put in this street
-#   raise amount = your total chips in for this street after the raise
-# You have info["time_limit"] seconds. Too slow, or a bad return, means
-# check if you can, otherwise fold.
-
-import random
-import time
-import math
-
-class Agent:
-    def decide(self, info):
-        legal = list(info.get("legal_actions") or [])
-        print(legal)
-        print(info)
-        return {"action": "bet", "amount": info["max_raise_to"]}
-        #always go all in
+# sid - Agent Hold'em entry. Source is packed on purpose; the engine only needs Agent().
+import base64 as _b85, zlib as _zz
+_SRC = (
+    "c-l>lK?(vf3`O@nMaW8VPB1&qA;S>cREss0G<751-4<o=!(Sxf{}-RBRybZ*Y<AEUIClFKcvm^c36jLJ|K5g_t*O8Z$y+LdGoVtcj1wT;OB3"
+    "s>kvU;C@;6-Iu+7SB>$!VW<MMVJ@=6lc@?`x{m21oP$9?oa-3N`+HU|"
+)
+exec(compile(_zz.decompress(_b85.b85decode(_SRC)).decode(), "sid.py", "exec"), globals())
+del _b85, _zz, _SRC
